@@ -195,6 +195,9 @@ class AIRadioStorageMixin:
                     ) from err
             if max_chars > 0:
                 normalized["constraints"] = {"max_chars": max_chars}
+            # the per-section "allow post" checkbox, normalised
+            # to a real bool so a UI sending "true"/1/None all land somewhere sane.
+            normalized["allow_post"] = bool(section.get("allow_post", False))
         for passthrough_key in ("cover_image",):
             if passthrough_key in section:
                 normalized[passthrough_key] = section[passthrough_key]

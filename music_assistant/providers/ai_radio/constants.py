@@ -121,6 +121,45 @@ ATTR_HOST_ID = "ai_radio_host_id"
 ATTR_QUEUE_DJ = "ai_radio_queue_dj"
 ATTR_GAP_NEXT_ID = "ai_radio_gap_next_id"
 ATTR_WEATHER_REQUIRED = "ai_radio_weather_required"
+# A post is NOT a section type. It is a per-section opt-in: any ai_text section
+# can be marked postable, and when one is planned into a gap its script is split
+# so the tail carries over the next record's intro. A section that cannot be
+# posted this time simply plays whole in the gap.
+ATTR_ALLOW_POST = "ai_radio_allow_post"
+# Written by the provider onto the HOST TRACK's queue item and read by
+# controllers/streams/audio.py, which cannot import from a provider. The literals
+# are duplicated there deliberately; keep the two in step.
+ATTR_POST_URL = "ai_radio_post_url"
+ATTR_POST_START = "ai_radio_post_start"
+ATTR_POST_END = "ai_radio_post_end"
+ATTR_POST_CLIP_OFFSET = "ai_radio_post_clip_offset"
+ATTR_POST_GAIN_DB = "ai_radio_post_gain_db"
+
+# A post is the tail of one continuous break carried over the next record's
+# intro. The break is rendered once and measured; nothing is predicted. With a
+# break of B seconds and an intro of W seconds before the vocal:
+#
+#   overlap = min(W, B - POST_MIN_HEAD_SECONDS)
+#
+# the break airs alone for its first B - overlap seconds, then the record starts
+# underneath and the last `overlap` seconds of the SAME recording play over it.
+# One voice, one render, no seam - and whenever the break is at least as long as
+# the intro, the voice finishes exactly as the singing starts.
+
+# Seconds of music left between the end of the voice and the vocal entry, so the
+# bed is fully back up exactly as the singer arrives.
+POST_TAIL_GAP = 0.4
+# Shortest overlap worth doing. Below this the handover is too brief to read as a
+# post and the break simply plays whole.
+POST_MIN_SECONDS = 1.5
+# The break always keeps at least this much for itself before the record comes
+# in, so its own queue item never ends up empty.
+POST_MIN_HEAD_SECONDS = 1.0
+# How long we are willing to wait for MA's own lyrics lookup before giving up on
+# a post. Not an attempt to fix that lookup - it walks every metadata provider
+# and can take far longer - just a refusal to let it hold up a clip that is
+# about to air. Over budget means no post; the break still plays.
+POST_LYRICS_TIMEOUT = 8.0
 
 # placeholders resolved at render time rather than at plan time, so the aired script
 # reflects the moment it plays

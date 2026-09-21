@@ -821,6 +821,156 @@ def _get_overlay_volume_filter(overlay_volume: int, output_channels: int) -> str
     return f"volume={gain}*{_MONO_WIDEN_COMPENSATION}^not(nb_channels-1)"
 
 
+# A "post" is the DJ talking over a record's instrumental intro and stopping as
+# the vocal arrives. It is the looping-overlay machinery below with three
+# differences: the clip plays ONCE rather than looping, it starts at a measured
+# offset rather than at zero, and the music ducks under it instead of both
+# sources running at full level.
+#
+# The duck is a trapezoidal `volume` expression rather than scheduled asendcmd
+# steps. One expression gives ramp-down, hold and ramp-up with nothing to
+# schedule, and it clamps on its own, so a ramp that would begin before the
+# record does is simply truncated. Measured at exactly -8.00 dB inside the post
+# and +0.00 dB outside it.
+POST_DUCK_DEPTH = 0.60  # fraction of the bed's level removed (0.60 -> -7.96 dB)
+POST_DUCK_RAMP = 0.4  # seconds, each side
+
+
+def _build_post_duck_filter(
+    voice_start: float, voice_end: float, depth: float, ramp: float
+) -> str:
+    """
+    Build the trapezoidal volume envelope that ducks the music under a post.
+
+    :param voice_start: Second at which the voice begins, relative to the track.
+    :param voice_end: Second at which the voice ends.
+    :param depth: Fraction of the level to remove while the voice is present.
+    :param ramp: Ramp length in seconds, applied to each side.
+    """
+    ramp = max(ramp, 0.01)
+    # NOT clamped to zero. When the voice is already talking as the record
+    # starts (voice_start == 0), the bed must be fully ducked from its first
+    # sample, and a negative duck_start is exactly what makes the expression
+    # below evaluate to full duck at t=0. FFmpeg's own max/min clamps the rest.
+    duck_start = voice_start - ramp
+    duck_end = voice_end + ramp
+    # the commas inside the expression are FFmpeg argument separators and must
+    # reach it backslash-escaped; rf-strings keep that backslash literal instead
+    # of Python reading it as an (invalid) escape sequence
+    envelope = (
+        rf"1-{depth:.4f}*max(0\,min(1\,min("
+        rf"(t-{duck_start:.3f})/{ramp:.3f}\,"
+        rf"({duck_end:.3f}-t)/{ramp:.3f})))"
+    )
+    return f"volume=eval=frame:volume='{envelope}'"
+
+
+def _build_post_mixer(
+    clip_input: str,
+    pcm_format: AudioFormat,
+    voice_start: float,
+    clip_offset: float = 0.0,
+    gain_db: float = 0.0,
+) -> ComplexFilter:
+    """
+    Build the filter mixing a one-shot voice clip into the music at an offset.
+
+    :param clip_input: File path or URL of the rendered TTS clip.
+    :param pcm_format: PCM format of the main input and the mixed output.
+    :param voice_start: Second of the track at which the voice should begin.
+    :param clip_offset: Second of the clip to start from. A post is the TAIL of a
+        break whose head has already aired as its own item, so the clip is read
+        from the point where that head stopped.
+    :param gain_db: Level applied to the clip, matching what its head aired at so
+        the voice does not change loudness as the record comes in.
+    """
+    input_args: list[str] = []
+    if clip_input.startswith("http"):
+        input_args += [
+            "-reconnect",
+            "1",
+            "-reconnect_delay_max",
+            "10",
+            "-reconnect_streamed",
+            "1",
+        ]
+    # deliberately NO -stream_loop: a post is said once
+    if clip_offset > 0:
+        # seek on the input, so the clip is read from where its head stopped
+        input_args += ["-ss", f"{clip_offset:.3f}"]
+    layout = _get_channel_layout_name(pcm_format.channels)
+    conform = f",aformat=channel_layouts={layout}" if layout else ""
+    delay_ms = max(0, int(round(voice_start * 1000)))
+    return ComplexFilter(
+        # duration=first follows the music, so a clip that somehow outlives the
+        # track cannot extend it
+        body="amix=inputs=2:duration=first:normalize=0",
+        inputs=[
+            ComplexFilterInput(
+                path=clip_input,
+                # conform BEFORE amix: it negotiates to the lowest common
+                # denominator, and HA serves TTS as 22.05 kHz mono, which would
+                # otherwise drag the whole mix down to that
+                filters=(
+                    f"speechnorm=e=12.5:r=0.0005:l=1,"
+                    f"volume={gain_db:.2f}dB,"
+                    f"aresample={pcm_format.sample_rate}"
+                    f"{conform},"
+                    f"adelay={delay_ms}:all=1"
+                ),
+                input_args=input_args,
+            )
+        ],
+    )
+
+
+async def get_ffmpeg_post_stream(
+    audio_input: AsyncGenerator[bytes],
+    clip_input: str,
+    pcm_format: AudioFormat,
+    voice_start: float,
+    voice_end: float,
+    duck_depth: float = POST_DUCK_DEPTH,
+    duck_ramp: float = POST_DUCK_RAMP,
+    clip_offset: float = 0.0,
+    gain_db: float = 0.0,
+    chunk_size: int | None = None,
+) -> AsyncGenerator[bytes]:
+    """
+    Mix a one-shot voice clip into a PCM stream, ducking the music under it.
+
+    The mixed output keeps the main input's PCM format and duration.
+
+    :param audio_input: The music stream (raw PCM in ``pcm_format``).
+    :param clip_input: File path or URL of the rendered TTS clip.
+    :param pcm_format: PCM format of both the main input and the mixed output.
+    :param voice_start: Second at which the voice begins, relative to the track.
+    :param voice_end: Second at which the voice ends.
+    :param duck_depth: Fraction of the bed's level removed while the voice plays.
+    :param duck_ramp: Ramp length in seconds, each side.
+    :param clip_offset: Second of the clip to start reading from.
+    :param gain_db: Level applied to the clip.
+    :param chunk_size: Optional exact chunk size for the yielded audio.
+    """
+    async with FFMpeg(
+        audio_input=audio_input,
+        input_format=copy(pcm_format),
+        output_format=pcm_format,
+        filter_params=[
+            # the duck is a plain single-input filter, so it precedes the mixer
+            # in the chain and applies to the music alone
+            _build_post_duck_filter(voice_start, voice_end, duck_depth, duck_ramp),
+            _build_post_mixer(clip_input, pcm_format, voice_start, clip_offset, gain_db),
+        ],
+        collect_log_history=True,
+    ) as ffmpeg_proc:
+        iterator = ffmpeg_proc.iter_chunked(chunk_size) if chunk_size else ffmpeg_proc.iter_any()
+        async for chunk in iterator:
+            yield chunk
+        with suppress(TimeoutError):
+            await ffmpeg_proc.wait_with_timeout(5)
+
+
 def _build_overlay_mixer(
     overlay_input: str, pcm_format: AudioFormat, overlay_volume: int
 ) -> ComplexFilter:

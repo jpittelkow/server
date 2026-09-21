@@ -137,7 +137,10 @@ from music_assistant.helpers.compare import compare_item_ids
 from music_assistant.helpers.dsp import ComplexFilter, filter_to_ffmpeg_params
 from music_assistant.helpers.ffmpeg import (
     FFMpeg,
+    POST_DUCK_DEPTH,
+    POST_DUCK_RAMP,
     get_ffmpeg_overlay_stream,
+    get_ffmpeg_post_stream,
     get_ffmpeg_stream,
 )
 from music_assistant.helpers.named_pipe import read_named_pipe
@@ -2655,6 +2658,14 @@ class StreamsAudio:
                         prepared_buffer=incoming_audio_buffer,
                     )
 
+                # An AI Radio post is bound to a track at an offset, so it wraps
+                # that track's own stream. Flow mode needs its own hook: the
+                # per-item path in the controller never runs for a player that
+                # takes a single continuous stream, which is most of them.
+                item_stream = self.get_post_mixed_stream(
+                    queue_track, item_stream, pcm_format
+                )
+
                 # closing here releases the decoders on an early exit,
                 # instead of leaving them to the garbage collector
                 async with aclosing(item_stream):
@@ -3015,6 +3026,98 @@ class StreamsAudio:
             # inform the queue controller that all audio data has been generated
             # so it can handle the case where new items were added after the flow stream ended
             self.mass.player_queues.queue_buffer_completed(queue.queue_id, queue_exhausted)
+
+        # Contract with the AI Radio provider, carried on the HOST TRACK's
+    # extra_attributes (the same channel a clip already uses for its prompt):
+    #
+    #   ai_radio_post_url    str   rendered TTS clip to mix in
+    #   ai_radio_post_start  float second the voice begins, relative to the track
+    #   ai_radio_post_end    float second the voice ends
+    #   ai_radio_post_duck   float optional depth override, 0..1
+    #   ai_radio_post_ramp   float optional ramp override, seconds
+    #   ai_radio_post_clip_offset float second of the clip to start reading from
+    #   ai_radio_post_gain_db     float level to apply to the clip
+    #
+    # Deliberately a passthrough unless all three required keys are present and
+    # sane: every track in the queue goes through this, so the cost of being
+    # wrong here is silence on ordinary playback.
+    POST_URL_ATTR = "ai_radio_post_url"
+    POST_START_ATTR = "ai_radio_post_start"
+    POST_END_ATTR = "ai_radio_post_end"
+    POST_DUCK_ATTR = "ai_radio_post_duck"
+    POST_RAMP_ATTR = "ai_radio_post_ramp"
+    POST_CLIP_OFFSET_ATTR = "ai_radio_post_clip_offset"
+    POST_GAIN_ATTR = "ai_radio_post_gain_db"
+
+    async def get_post_mixed_stream(
+        self,
+        queue_item: QueueItem,
+        audio_input: AsyncGenerator[bytes],
+        pcm_format: AudioFormat,
+    ) -> AsyncGenerator[bytes]:
+        """
+        Mix an AI Radio post into a track's stream, if one is scheduled for it.
+
+        Returns the input untouched when the item carries no post, or when what
+        it carries does not describe a usable window.
+
+        :param queue_item: The item being streamed, read for post attributes.
+        :param audio_input: The track's audio (raw PCM in ``pcm_format``).
+        :param pcm_format: PCM format of both the input and the mixed output.
+        """
+        attributes = queue_item.extra_attributes or {}
+        clip_url = str(attributes.get(self.POST_URL_ATTR) or "")
+        if not clip_url:
+            async for chunk in audio_input:
+                yield chunk
+            return
+        # every offset here is measured from the start of the track, so a seek
+        # would place the voice somewhere arbitrary. Play the track clean.
+        if getattr(queue_item.streamdetails, "seek_position", 0):
+            self.logger.debug(
+                "AI Radio post on %s skipped: the track was seeked", queue_item.name
+            )
+            async for chunk in audio_input:
+                yield chunk
+            return
+        try:
+            voice_start = float(attributes[self.POST_START_ATTR])
+            voice_end = float(attributes[self.POST_END_ATTR])
+        except (KeyError, TypeError, ValueError):
+            self.logger.warning(
+                "AI Radio post on %s has no usable window; playing the track clean",
+                queue_item.name,
+            )
+            async for chunk in audio_input:
+                yield chunk
+            return
+        if not 0.0 <= voice_start < voice_end:
+            self.logger.warning(
+                "AI Radio post on %s has window %.2f-%.2f; playing the track clean",
+                queue_item.name,
+                voice_start,
+                voice_end,
+            )
+            async for chunk in audio_input:
+                yield chunk
+            return
+
+        self.logger.debug(
+            "AI Radio post on %s: voice %.2f-%.2fs", queue_item.name, voice_start, voice_end
+        )
+        async for chunk in get_ffmpeg_post_stream(
+            audio_input=audio_input,
+            clip_input=clip_url,
+            pcm_format=pcm_format,
+            voice_start=voice_start,
+            voice_end=voice_end,
+            duck_depth=float(attributes.get(self.POST_DUCK_ATTR) or POST_DUCK_DEPTH),
+            duck_ramp=float(attributes.get(self.POST_RAMP_ATTR) or POST_DUCK_RAMP),
+            clip_offset=float(attributes.get(self.POST_CLIP_OFFSET_ATTR) or 0.0),
+            gain_db=float(attributes.get(self.POST_GAIN_ATTR) or 0.0),
+            chunk_size=pcm_format.pcm_sample_size,
+        ):
+            yield chunk
 
     async def get_overlay_mixed_stream(
         self,

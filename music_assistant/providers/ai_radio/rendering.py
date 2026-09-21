@@ -6,6 +6,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
+import tempfile
+import time
+
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -35,6 +40,7 @@ from music_assistant.helpers.tts import (
     resolve_tts_stream_path,
 )
 
+from .post_window import lyric_onset
 from .constants import (
     ATTR_HOST_ID,
     ATTR_MAX_CHARS,
@@ -42,7 +48,17 @@ from .constants import (
     ATTR_RENDERED_TEXT,
     ATTR_SESSION_ID,
     ATTR_WEATHER_REQUIRED,
+    ATTR_ALLOW_POST,
+    ATTR_POST_CLIP_OFFSET,
+    ATTR_POST_END,
+    ATTR_POST_GAIN_DB,
+    ATTR_POST_START,
+    ATTR_POST_URL,
     ATTR_WEB_SEARCH_MODE,
+    POST_LYRICS_TIMEOUT,
+    POST_MIN_HEAD_SECONDS,
+    POST_MIN_SECONDS,
+    POST_TAIL_GAP,
     CLIP_STREAMDETAILS_EXPIRATION,
     CONF_TTS_LOUDNESS_BOOST,
     DEFAULT_TTS_LOUDNESS_BOOST,
@@ -90,6 +106,9 @@ class _ClipAudio:
     path: str
     input_format: AudioFormat
     gain_db: float
+    # when set, the clip stops here: the rest of it is carried over the next
+    # record's intro as a post
+    end: float | None = None
 
 
 class AIRadioRenderMixin:
@@ -129,6 +148,8 @@ class AIRadioRenderMixin:
                 # the signal is what marks the items cache dirty and schedules the persist
                 self.mass.player_queues.signal_update(queue_item.queue_id, items_changed=True)
             media = await self._cached_clip_media(queue_item, text, item_id)
+            gain_db = self._loudness_gain(queue_item.queue_id, media.loudness)
+            post = await self._plan_post(queue_item, media, item_id, gain_db or 0.0)
 
         streamdetails = StreamDetails(
             provider=self.instance_id,
@@ -146,8 +167,16 @@ class AIRadioRenderMixin:
             # that url has left or the stream outlives the token behind it
             expiration=self._remaining_media_lifetime(media),
         )
-        gain_db = self._loudness_gain(queue_item.queue_id, media.loudness)
-        if gain_db is not None:
+        if post is not None:
+            head, staged = post
+            # a carried-over clip always goes through get_audio_stream, because
+            # that is the one place its end can be cut short - and it is served
+            # from the staged copy, so head and tail are the same recording
+            streamdetails.duration = max(1, math.ceil(head))
+            streamdetails.stream_type = StreamType.CUSTOM
+            streamdetails.decoded_audio_format = replace(TTS_CLIP_PCM_FORMAT)
+            streamdetails.data = _ClipAudio(staged, media.audio_format, gain_db or 0.0, head)
+        elif gain_db is not None:
             # core never normalizes a sound effect, so the clip is levelled here or it
             # airs noticeably quieter than the music around it
             streamdetails.stream_type = StreamType.CUSTOM
@@ -167,15 +196,19 @@ class AIRadioRenderMixin:
         :param seek_position: Ignored, a spoken clip cannot be seeked.
         """
         clip = cast("_ClipAudio", streamdetails.data)
+        filters = [
+            TTS_SPEECHNORM_FILTER,
+            f"volume={round(clip.gain_db, 2)}dB",
+            f"alimiter=limit={TTS_PEAK_CEILING_DB}dB:level=false:latency=true",
+        ]
+        if clip.end is not None:
+            # the rest of this clip is carried over the next record as a post
+            filters.insert(0, f"atrim=end={clip.end:.3f}")
         async for chunk in get_ffmpeg_stream(
             audio_input=clip.path,
             input_format=clip.input_format,
             output_format=TTS_CLIP_PCM_FORMAT,
-            filter_params=[
-                TTS_SPEECHNORM_FILTER,
-                f"volume={round(clip.gain_db, 2)}dB",
-                f"alimiter=limit={TTS_PEAK_CEILING_DB}dB:level=false:latency=true",
-            ],
+            filter_params=filters,
         ):
             yield chunk
 
@@ -213,6 +246,226 @@ class AIRadioRenderMixin:
             del self._media_cache[expired_id]
         self._media_cache[clip_id] = media
         return media
+
+    def _post_skipped(self, item_name: str, reason: str) -> None:
+        """
+        Record why an opted-in break did not post.
+
+        Logged at INFO on purpose. A post that silently fails to happen is
+        indistinguishable from one that was never enabled, and only sections
+        with the flag on reach here, so ordinary breaks add no noise.
+
+        :param item_name: The track the post would have been attached to.
+        :param reason: Why it was not.
+        """
+        self.logger.info("AI Radio post skipped on %s: %s", item_name, reason)
+
+    async def _precise_duration(self, path: str) -> float | None:
+        """
+        Return a clip's duration in seconds, to the fraction.
+
+        _probe_duration rounds to whole seconds, which is fine for a queue item
+        but too coarse to land a voice on a vocal entry.
+
+        :param path: Local path of the clip.
+        """
+        try:
+            tags = await async_parse_tags(path, require_duration=True)
+        except (InvalidDataError, OSError) as err:
+            self.logger.debug("AI Radio could not measure post clip %s: %s", path, err)
+            return None
+        return float(tags.duration) if tags.duration else None
+
+    async def _plan_post(
+        self, queue_item: QueueItem, media: _CachedClipMedia, clip_id: str, gain_db: float
+    ) -> tuple[float, str] | None:
+        """
+        Decide whether a break carries over the next record, and arm that record.
+
+        Pure arithmetic on a measured recording - nothing is predicted. The break
+        is rendered once, whole. If it is B seconds long and the next record has W
+        seconds before its vocal, the record starts underneath the break's last
+        min(W, B) seconds, so one continuous voice runs straight through the
+        segue and finishes as the singing starts.
+
+        Returns ``(head_seconds, staged_path)`` - how long the break airs alone,
+        and the local copy both halves are read from - or None when it airs whole.
+
+        :param queue_item: The clip about to air.
+        :param media: The clip as minted.
+        :param clip_id: The clip's id, so a repeat request reuses the same plan.
+        :param gain_db: The level the clip airs at, so the carried-over tail matches.
+        """
+        if not queue_item.extra_attributes.get(ATTR_ALLOW_POST):
+            return None
+        plans: dict[str, tuple[float, str] | None] = self.__dict__.setdefault(
+            "_post_plans", {}
+        )
+        if clip_id in plans:
+            # get_stream_details can be asked for the same clip more than once
+            return plans[clip_id]
+        plans[clip_id] = None
+
+        next_item = self.mass.player_queues.get_next_item(
+            queue_item.queue_id, queue_item.queue_item_id
+        )
+        if next_item is None or next_item.media_item is None:
+            self._post_skipped(queue_item.name, "no next track in the queue")
+            return None
+        onset, reason = await self._resolve_vocal_onset(next_item)
+        if onset is None:
+            self._post_skipped(next_item.name, reason)
+            return None
+        window = onset - POST_TAIL_GAP
+        if window < POST_MIN_SECONDS:
+            self._post_skipped(
+                next_item.name, f"vocal enters at {onset:.1f}s, too little instrumental intro"
+            )
+            return None
+
+        staged = await self._stage_post_clip(media.path)
+        if staged is None:
+            self._post_skipped(next_item.name, "rendered audio could not be fetched")
+            return None
+        total = await self._precise_duration(staged)
+        if not total:
+            self._post_skipped(next_item.name, "rendered audio has no measurable duration")
+            return None
+
+        overlap = min(window, total - POST_MIN_HEAD_SECONDS)
+        if overlap < POST_MIN_SECONDS:
+            self._post_skipped(
+                next_item.name, f"break is only {total:.1f}s, too short to carry over"
+            )
+            return None
+        head = total - overlap
+
+        # the voice is already talking when the record starts, so the record comes
+        # in underneath it from its first second rather than after a ramp
+        next_item.extra_attributes.update(
+            {
+                ATTR_POST_URL: staged,
+                ATTR_POST_CLIP_OFFSET: head,
+                ATTR_POST_START: 0.0,
+                ATTR_POST_END: overlap,
+                ATTR_POST_GAIN_DB: gain_db,
+            }
+        )
+        self.logger.info(
+            "AI Radio post armed on %s: break %.1fs airs alone for %.1fs, last %.1fs "
+            "over the intro, vocal at %.1fs",
+            next_item.name,
+            total,
+            head,
+            overlap,
+            onset,
+        )
+        plans[clip_id] = (head, staged)
+        return plans[clip_id]
+
+    # A post is armed when its clip is minted and consumed when the next track
+    # starts, which can be a minute or more later. An HA tts_proxy URL does not
+    # survive that: Home Assistant drops the token about 60 s after its last
+    # use, and the mixer then gets a 500 instead of a voice. MA's own clips work
+    # around it by re-minting on expiry; a post cannot, because its offsets are
+    # already baked into the track it is attached to.
+    #
+    # So the audio is fetched once, at arm time, and what gets armed is a local
+    # file. Nothing remote is touched at playback.
+    POST_CLIP_PREFIX = "ma_ai_radio_post_"
+    # staged clips older than this are leftovers from a post that never aired
+    POST_CLIP_MAX_AGE = 3600
+
+    async def _stage_post_clip(self, path: str) -> str | None:
+        """
+        Copy a rendered post clip to a local file and return its path.
+
+        Returns the input unchanged when it is already a local file, and None
+        when the audio could not be fetched - in which case the caller airs the
+        break whole rather than arming a post that would fail at playback.
+
+        :param path: Path or URL the TTS engine returned.
+        """
+        if not path.lower().startswith(("http://", "https://")):
+            return path
+        try:
+            async with self.mass.http_session.get(path) as response:
+                if response.status != 200:
+                    self.logger.warning(
+                        "AI Radio post clip fetch returned HTTP %s; airing the break whole",
+                        response.status,
+                    )
+                    return None
+                audio = await response.read()
+        except Exception as err:  # noqa: BLE001 - a post must never break a clip
+            self.logger.warning("AI Radio post clip could not be fetched: %s", err)
+            return None
+        if not audio:
+            return None
+
+        def _write() -> str:
+            self._prune_post_clips()
+            handle, staged = tempfile.mkstemp(prefix=self.POST_CLIP_PREFIX, suffix=".mp3")
+            with os.fdopen(handle, "wb") as staged_file:
+                staged_file.write(audio)
+            return staged
+
+        return await asyncio.to_thread(_write)
+
+    def _prune_post_clips(self) -> None:
+        """Delete staged clips left behind by posts that never aired."""
+        cutoff = time.time() - self.POST_CLIP_MAX_AGE
+        directory = tempfile.gettempdir()
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        for name in names:
+            if not name.startswith(self.POST_CLIP_PREFIX):
+                continue
+            stale = os.path.join(directory, name)
+            try:
+                if os.path.getmtime(stale) < cutoff:
+                    os.remove(stale)
+            except OSError:
+                # another pass removed it, or it is not ours to remove
+                continue
+
+    async def _resolve_vocal_onset(self, queue_item: QueueItem) -> tuple[float | None, str]:
+        """
+        Return the next track's vocal entry in seconds, and a reason when there is none.
+
+        Deliberately thin. Lyrics are Music Assistant's job and it already has a
+        provider chain, a native ``metadata.lrc_lyrics`` field and its own
+        persistence - so this asks for them and does nothing clever. Lyrics
+        already on the item cost nothing and are used as-is.
+
+        The only thing added is a time budget: MA's lookup walks every metadata
+        provider and can block far longer than a clip about to air can wait.
+
+        :param queue_item: The upcoming track.
+        """
+        media_item = queue_item.media_item
+        if media_item is None:
+            return None, "no track details"
+        metadata = getattr(media_item, "metadata", None)
+        stored = getattr(metadata, "lrc_lyrics", None)
+        if onset := lyric_onset(stored):
+            return onset, ""
+        try:
+            async with asyncio.timeout(POST_LYRICS_TIMEOUT):
+                plain, lrc_lyrics = await self.mass.metadata.get_track_lyrics(media_item)
+        except TimeoutError:
+            return None, f"lyrics lookup took longer than {POST_LYRICS_TIMEOUT:.0f}s"
+        except Exception as err:  # noqa: BLE001 - a lyrics failure must never break a clip
+            return None, f"lyrics lookup failed ({err})"
+        if onset := lyric_onset(lrc_lyrics):
+            return onset, ""
+        if lrc_lyrics:
+            return None, "synced lyrics have no sung line"
+        if plain:
+            return None, "only unsynced lyrics available, so no vocal timing"
+        return None, "no lyrics found"
 
     def _remaining_media_lifetime(self, media: _CachedClipMedia) -> int:
         """Return the seconds the given minted media is still usable for."""

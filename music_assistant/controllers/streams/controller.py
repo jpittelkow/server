@@ -925,6 +925,10 @@ class StreamsController(CoreController):
                 # radio plays as a single long-lived stream (never in flow mode),
                 # so mix the audio overlay in here
                 audio_input = self.audio.get_overlay_mixed_stream(queue, audio_input, pcm_format)
+            # an AI Radio post is bound to a track at an offset rather
+            # than to the queue, so it hooks the item stream rather than the
+            # queue overlay. Passthrough unless this item carries one.
+            audio_input = self.audio.get_post_mixed_stream(queue_item, audio_input, pcm_format)
             # stream the audio
             # this final ffmpeg process in the chain converts raw lossless PCM into
             # the desired output format for the player including any player specific
