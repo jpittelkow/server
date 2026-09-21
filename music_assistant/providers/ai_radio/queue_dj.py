@@ -16,6 +16,7 @@ from music_assistant.controllers.player_queues.helpers import committed_index
 from music_assistant.helpers.json import async_json_loads
 
 from .constants import ATTR_GAP_NEXT_ID, ATTR_QUEUE_DJ, ATTR_SESSION_ID
+from .helpers import describe_track
 from .models import DJQueueState, PlannedSection, SessionState
 
 if TYPE_CHECKING:
@@ -523,7 +524,10 @@ class AIRadioQueueDJMixin:
             "item_id": item.queue_item_id,
             "name": name,
             "artist": artist,
-            "songinfo": f"{artist} - {name}".strip(" -"),
+            # AI RADIO POST FORK: media_item is held locally even though it is
+            # not stored in the dict, so the queue DJ gets the same richer
+            # description the station-run path does
+            "songinfo": describe_track(item.media_item, artist, name),
             "duration": item.duration,
             "media_item": None,
         }

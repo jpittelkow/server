@@ -71,6 +71,7 @@ from .helpers import (
     is_empty_section,
     pick_weighted_choice,
     slugify,
+    describe_track,
     track_songinfo,
     utc_now_iso,
 )
@@ -448,7 +449,9 @@ class AIRadioRuntimeMixin:
                     "item_id": track.item_id,
                     "name": track.name,
                     "artist": artist,
-                    "songinfo": f"{artist} - {track.name}".strip(" -"),
+                    # AI RADIO POST FORK: was f"{artist} - {track.name}" - see
+                    # helpers.describe_track for why that was not enough
+                    "songinfo": describe_track(track, artist, track.name),
                     "duration": track.duration,
                     "uri": uri,
                     "media_item": track,
