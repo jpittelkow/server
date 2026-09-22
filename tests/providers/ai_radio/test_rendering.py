@@ -36,6 +36,7 @@ from music_assistant.helpers.tags import AudioTags
 from music_assistant.helpers.tts import TTSLanguageNotSupportedError
 from music_assistant.models.plugin import PluginProvider, TTSEngine
 from music_assistant.providers.ai_radio.constants import (
+    ATTR_ALLOW_POST,
     ATTR_HOST_ID,
     ATTR_MAX_CHARS,
     ATTR_PROMPT,
@@ -54,7 +55,7 @@ from music_assistant.providers.ai_radio.constants import (
     TTS_SPEECHNORM_FILTER,
 )
 from music_assistant.providers.ai_radio.models import SessionState
-from music_assistant.providers.ai_radio.rendering import AIRadioRenderMixin
+from music_assistant.providers.ai_radio.rendering import AIRadioRenderMixin, _PostPlan
 
 
 class DummyRenderer(AIRadioRenderMixin):
@@ -1068,6 +1069,36 @@ async def test_the_levelled_clip_does_not_hand_out_the_shared_pcm_format() -> No
 
     assert streamdetails.decoded_audio_format == TTS_CLIP_PCM_FORMAT
     assert streamdetails.decoded_audio_format is not TTS_CLIP_PCM_FORMAT
+
+
+async def test_a_break_planned_to_carry_over_leaves_the_cut_to_the_audio_stage() -> None:
+    """The plan travels with the clip as minted, so the break can still air whole later."""
+    renderer = DummyRenderer()
+    item = _clip_item("sess_001")
+    item.extra_attributes[ATTR_ALLOW_POST] = True
+    _attach_queue(renderer, [item])
+    plan = _PostPlan(
+        head=7.6,
+        overlap=11.6,
+        staged="/data/ma_ai_radio_post_staged.mp3",
+        gain_db=-2.0,
+        queue_id="player_a",
+        clip_item_id="qi_sess_001",
+        track_item_id="qi_song",
+        track_name="Song",
+    )
+    cast("Any", renderer)._plan_post = AsyncMock(return_value=plan)
+
+    streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+
+    # reported as the length it airs for once cut, which is what it does unless the plan
+    # falls through before the airing
+    assert streamdetails.duration == 8
+    assert streamdetails.stream_type == StreamType.CUSTOM
+    assert streamdetails.decoded_audio_format == TTS_CLIP_PCM_FORMAT
+    assert streamdetails.data.post is plan
+    assert streamdetails.data.path == streamdetails.path
+    assert streamdetails.data.gain_db == -2.0
 
 
 # verbatim ffmpeg 7.1 output, so the parsing this depends on is covered for real
