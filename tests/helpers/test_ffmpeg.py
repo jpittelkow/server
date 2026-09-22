@@ -25,11 +25,14 @@ from music_assistant.helpers.ffmpeg import (
     FFMpegStreamInfo,
     _build_filtergraph_args,
     _build_overlay_mixer,
+    _build_post_duck_filter,
+    _build_post_mixer,
     _get_overlay_volume_filter,
     check_ffmpeg_version,
     get_ffmpeg_args,
     get_ffmpeg_hls_cmaf_input_args,
     get_ffmpeg_overlay_stream,
+    get_ffmpeg_post_stream,
     get_ffmpeg_stream,
     parse_ffmpeg_duration,
     parse_ffmpeg_stream_info,
@@ -883,6 +886,135 @@ def test_overlay_args_probe_the_main_input_and_add_no_filters() -> None:
     assert "-af" not in args
     assert args.count("-filter_complex") == 1
     assert not any(arg.startswith(("pan=", "aresample=resampler=")) for arg in args)
+
+
+# -- get_ffmpeg_post_stream (end-to-end with a real ffmpeg process) --
+
+
+async def _tone(seconds: int) -> AsyncGenerator[bytes]:
+    """Yield the given amount of seconds of a constant-level PCM square wave."""
+    period = array("h", [8000] * 100 + [-8000] * 100)
+    second = (period * (_PCM_FORMAT.sample_rate * _PCM_FORMAT.channels // len(period))).tobytes()
+    assert len(second) == _BYTES_PER_SECOND
+    for _ in range(seconds):
+        yield second
+
+
+@pytest.fixture
+def silent_clip(tmp_path: Path) -> Path:
+    """Generate a 1 second silent wav file, a voice clip that adds nothing to the mix."""
+    clip_path = tmp_path / "silent_clip.wav"
+    subprocess.run(  # noqa: S603
+        ["ffmpeg", "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", "1", str(clip_path)],  # noqa: S607
+        check=True,
+        capture_output=True,
+    )
+    return clip_path
+
+
+async def test_post_stream_says_the_clip_once_at_its_offset(overlay_file: Path) -> None:
+    """The clip comes in where it was placed, is not looped, and the length is kept."""
+    chunks = await _collect_chunks(
+        get_ffmpeg_post_stream(
+            audio_input=_silence(3),
+            clip_input=str(overlay_file),
+            pcm_format=_PCM_FORMAT,
+            voice_start=1.0,
+            voice_end=2.0,
+            chunk_size=_BYTES_PER_SECOND,
+        )
+    )
+    output = b"".join(chunks)
+    # duration=first: output length exactly matches the 3s main input
+    assert len(output) == 3 * _BYTES_PER_SECOND
+    # the main input was pure silence, so any signal is the 1s clip
+    assert not any(output[:_BYTES_PER_SECOND])
+    assert any(output[_BYTES_PER_SECOND : 2 * _BYTES_PER_SECOND])
+    assert not any(output[2 * _BYTES_PER_SECOND :])
+
+
+async def test_post_stream_reads_the_clip_from_where_its_head_stopped(
+    overlay_file_with_silent_intro: Path,
+) -> None:
+    """The part of the clip that already aired as its own item is not said again."""
+    output = b"".join(
+        await _collect_chunks(
+            get_ffmpeg_post_stream(
+                audio_input=_silence(2),
+                # 1s of silence, then a 1s tone
+                clip_input=str(overlay_file_with_silent_intro),
+                pcm_format=_PCM_FORMAT,
+                voice_start=0.0,
+                voice_end=1.0,
+                clip_offset=1.0,
+            )
+        )
+    )
+    assert len(output) == 2 * _BYTES_PER_SECOND
+    assert _rms(_samples(output[: _BYTES_PER_SECOND // 2])) > 100
+    assert not any(output[int(1.5 * _BYTES_PER_SECOND) :])
+
+
+async def test_post_stream_ducks_the_music_only_under_the_voice(silent_clip: Path) -> None:
+    """The music drops by the duck depth while the voice is there and comes back after."""
+    output = b"".join(
+        await _collect_chunks(
+            get_ffmpeg_post_stream(
+                audio_input=_tone(4),
+                clip_input=str(silent_clip),
+                pcm_format=_PCM_FORMAT,
+                voice_start=1.5,
+                voice_end=2.5,
+                duck_depth=0.6,
+                duck_ramp=0.4,
+            )
+        )
+    )
+    assert len(output) == 4 * _BYTES_PER_SECOND
+
+    def level(start: float, end: float) -> float:
+        frame = _PCM_FORMAT.channels * 2
+        first = int(start * _BYTES_PER_SECOND) // frame * frame
+        last = int(end * _BYTES_PER_SECOND) // frame * frame
+        return _rms(_samples(output[first:last]))
+
+    before, under, after = level(0.2, 1.0), level(1.6, 2.4), level(3.1, 3.9)
+    assert before == pytest.approx(8000, rel=0.02)
+    assert after == pytest.approx(before, rel=0.02)
+    assert under == pytest.approx(before * 0.4, rel=0.05)
+
+
+async def test_post_stream_raises_when_the_clip_cannot_be_opened(tmp_path: Path) -> None:
+    """A clip that is gone must surface as an error, not as a record that silently vanishes."""
+    with pytest.raises(AudioError):
+        await _collect_chunks(
+            get_ffmpeg_post_stream(
+                audio_input=_silence(1),
+                clip_input=str(tmp_path / "pruned.mp3"),
+                pcm_format=_PCM_FORMAT,
+                voice_start=0.0,
+                voice_end=1.0,
+            )
+        )
+
+
+def test_post_duck_filter_is_fully_down_when_the_voice_leads_the_record() -> None:
+    """A voice already talking at the first sample needs the ramp to start before zero."""
+    duck = _build_post_duck_filter(voice_start=0.0, voice_end=8.0, depth=0.6, ramp=0.4)
+    assert duck.startswith("volume=eval=frame:volume=")
+    assert "(t--0.400)/0.400" in duck
+    assert "(8.400-t)/0.400" in duck
+
+
+def test_post_mixer_says_the_clip_once_from_its_offset() -> None:
+    """A post is never looped, is read from where its head stopped, and starts on time."""
+    (clip,) = _build_post_mixer(
+        "/clip.mp3", _PCM_FORMAT, voice_start=1.25, clip_offset=7.5, gain_db=-2.0
+    ).inputs
+    assert "-stream_loop" not in clip.input_args
+    assert clip.input_args == ["-ss", "7.500"]
+    assert "volume=-2.00dB" in clip.filters
+    assert clip.filters.endswith("adelay=1250:all=1")
 
 
 @pytest.mark.parametrize(
