@@ -822,9 +822,9 @@ def _get_overlay_volume_filter(overlay_volume: int, output_channels: int) -> str
 
 
 # A post is the DJ talking over a record's intro and stopping as the vocal arrives: the
-# overlay mixer below, except that the clip plays once from an offset and the music ducks
-# under it. The duck is a single trapezoidal `volume` expression (ramp down, hold, ramp up),
-# measured at -8 dB inside the voice and 0 dB outside it.
+# overlay mixer below, except that the clip plays once from an offset, at its own level,
+# and the music ducks under it. The duck is a single trapezoidal `volume` expression (ramp
+# down, hold, ramp up), measured at -8 dB inside the voice and 0 dB outside it.
 POST_DUCK_DEPTH = 0.60  # fraction of the level removed under the voice
 POST_DUCK_RAMP = 0.4  # seconds, each side
 
@@ -850,26 +850,17 @@ def _build_post_duck_filter(voice_start: float, voice_end: float) -> str:
 
 
 def _build_post_mixer(
-    clip_input: str,
-    pcm_format: AudioFormat,
-    voice_start: float,
-    clip_offset: float = 0.0,
-    gain_db: float = 0.0,
+    clip_path: str, pcm_format: AudioFormat, voice_start: float, clip_offset: float = 0.0
 ) -> ComplexFilter:
     """
     Build the filter mixing a one-shot voice clip into the music at an offset.
 
-    :param clip_input: File path or URL of the rendered TTS clip.
+    :param clip_path: Local path of the voice clip, already at the level it mixes in at.
     :param pcm_format: PCM format of the main input and the mixed output.
     :param voice_start: Second of the track at which the voice should begin.
     :param clip_offset: Second of the clip to start reading from.
-    :param gain_db: Level applied to the clip.
     """
-    input_args: list[str] = []
-    if clip_input.startswith("http"):
-        input_args += ["-reconnect", "1", "-reconnect_delay_max", "10", "-reconnect_streamed", "1"]
-    if clip_offset > 0:
-        input_args += ["-ss", f"{clip_offset:.3f}"]
+    input_args = ["-ss", f"{clip_offset:.3f}"] if clip_offset > 0 else []
     layout = _get_channel_layout_name(pcm_format.channels)
     conform = f",aformat=channel_layouts={layout}" if layout else ""
     delay_ms = max(0, round(voice_start * 1000))
@@ -878,16 +869,10 @@ def _build_post_mixer(
         body="amix=inputs=2:duration=first:normalize=0",
         inputs=[
             ComplexFilterInput(
-                path=clip_input,
-                # resampled before amix, which otherwise negotiates the whole mix down to
-                # the clip's rate (HA serves TTS as 22.05 kHz mono)
-                filters=(
-                    f"speechnorm=e=12.5:r=0.0005:l=1,"
-                    f"volume={gain_db:.2f}dB,"
-                    f"aresample={pcm_format.sample_rate}"
-                    f"{conform},"
-                    f"adelay={delay_ms}:all=1"
-                ),
+                path=clip_path,
+                # brought to the music's rate ahead of amix, so its negotiation never
+                # touches the music
+                filters=f"aresample={pcm_format.sample_rate}{conform},adelay={delay_ms}:all=1",
                 input_args=input_args,
             )
         ],
@@ -896,26 +881,25 @@ def _build_post_mixer(
 
 async def get_ffmpeg_post_stream(
     audio_input: AsyncGenerator[bytes],
-    clip_input: str,
+    clip_path: str,
     pcm_format: AudioFormat,
     voice_start: float,
     voice_end: float,
     clip_offset: float = 0.0,
-    gain_db: float = 0.0,
     chunk_size: int | None = None,
 ) -> AsyncGenerator[bytes]:
     """
     Mix a one-shot voice clip into a PCM stream, ducking the music under it.
 
-    The mixed output keeps the main input's PCM format and duration.
+    The clip mixes in at its own level, and the mixed output keeps the main input's PCM
+    format and duration.
 
     :param audio_input: The music stream (raw PCM in ``pcm_format``).
-    :param clip_input: File path or URL of the rendered TTS clip.
+    :param clip_path: Local path of the voice clip.
     :param pcm_format: PCM format of both the main input and the mixed output.
     :param voice_start: Second at which the voice begins, relative to the track.
     :param voice_end: Second at which the voice ends.
     :param clip_offset: Second of the clip to start reading from.
-    :param gain_db: Level applied to the clip.
     :param chunk_size: Optional exact chunk size for the yielded audio.
     """
     async with FFMpeg(
@@ -925,7 +909,7 @@ async def get_ffmpeg_post_stream(
         filter_params=[
             # the duck applies to the music alone, so it precedes the two-input mixer
             _build_post_duck_filter(voice_start, voice_end),
-            _build_post_mixer(clip_input, pcm_format, voice_start, clip_offset, gain_db),
+            _build_post_mixer(clip_path, pcm_format, voice_start, clip_offset),
         ],
         collect_log_history=True,
     ) as ffmpeg_proc:

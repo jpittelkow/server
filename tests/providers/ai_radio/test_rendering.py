@@ -1074,14 +1074,15 @@ async def test_the_levelled_clip_does_not_hand_out_the_shared_pcm_format() -> No
 async def test_a_break_planned_to_carry_over_leaves_the_cut_to_the_audio_stage() -> None:
     """The plan travels with the clip as minted, so the break can still air whole later."""
     renderer = DummyRenderer()
+    renderer.measured_loudness = -18.0
     item = _clip_item("sess_001")
     item.extra_attributes[ATTR_ALLOW_POST] = True
     _attach_queue(renderer, [item])
+    _attach_normalization(renderer, target=-14, boost=3)
     plan = _PostPlan(
         head=7.6,
         overlap=11.6,
-        staged="/data/ma_ai_radio_post_staged.mp3",
-        gain_db=-2.0,
+        staged="/data/ma_ai_radio_post_staged.wav",
         queue_id="player_a",
         clip_item_id="qi_sess_001",
         track_item_id="qi_song",
@@ -1098,7 +1099,7 @@ async def test_a_break_planned_to_carry_over_leaves_the_cut_to_the_audio_stage()
     assert streamdetails.decoded_audio_format == TTS_CLIP_PCM_FORMAT
     assert streamdetails.data.post is plan
     assert streamdetails.data.path == streamdetails.path
-    assert streamdetails.data.gain_db == -2.0
+    assert streamdetails.data.gain_db == pytest.approx(7.0)
 
 
 # verbatim ffmpeg 7.1 output, so the parsing this depends on is covered for real

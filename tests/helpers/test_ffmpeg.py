@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import wave
 from array import array
 from collections.abc import AsyncGenerator, Sequence
 from math import sqrt
@@ -918,7 +919,7 @@ async def test_post_stream_says_the_clip_once_at_its_offset(overlay_file: Path) 
     chunks = await _collect_chunks(
         get_ffmpeg_post_stream(
             audio_input=_silence(3),
-            clip_input=str(overlay_file),
+            clip_path=str(overlay_file),
             pcm_format=_PCM_FORMAT,
             voice_start=1.0,
             voice_end=2.0,
@@ -943,7 +944,7 @@ async def test_post_stream_reads_the_clip_from_where_its_head_stopped(
             get_ffmpeg_post_stream(
                 audio_input=_silence(2),
                 # 1s of silence, then a 1s tone
-                clip_input=str(overlay_file_with_silent_intro),
+                clip_path=str(overlay_file_with_silent_intro),
                 pcm_format=_PCM_FORMAT,
                 voice_start=0.0,
                 voice_end=1.0,
@@ -962,7 +963,7 @@ async def test_post_stream_ducks_the_music_only_under_the_voice(silent_clip: Pat
         await _collect_chunks(
             get_ffmpeg_post_stream(
                 audio_input=_tone(4),
-                clip_input=str(silent_clip),
+                clip_path=str(silent_clip),
                 pcm_format=_PCM_FORMAT,
                 voice_start=1.5,
                 voice_end=2.5,
@@ -989,7 +990,7 @@ async def test_post_stream_raises_when_the_clip_cannot_be_opened(tmp_path: Path)
         await _collect_chunks(
             get_ffmpeg_post_stream(
                 audio_input=_silence(1),
-                clip_input=str(tmp_path / "pruned.mp3"),
+                clip_path=str(tmp_path / "pruned.mp3"),
                 pcm_format=_PCM_FORMAT,
                 voice_start=0.0,
                 voice_end=1.0,
@@ -1007,13 +1008,28 @@ def test_post_duck_filter_is_fully_down_when_the_voice_leads_the_record() -> Non
 
 def test_post_mixer_says_the_clip_once_from_its_offset() -> None:
     """A post is never looped, is read from where its head stopped, and starts on time."""
-    (clip,) = _build_post_mixer(
-        "/clip.mp3", _PCM_FORMAT, voice_start=1.25, clip_offset=7.5, gain_db=-2.0
-    ).inputs
-    assert "-stream_loop" not in clip.input_args
+    (clip,) = _build_post_mixer("/clip.wav", _PCM_FORMAT, voice_start=1.25, clip_offset=7.5).inputs
     assert clip.input_args == ["-ss", "7.500"]
-    assert "volume=-2.00dB" in clip.filters
-    assert clip.filters.endswith("adelay=1250:all=1")
+    # nothing levels the clip here: it arrives at the level it should mix in at
+    assert clip.filters == "aresample=44100,aformat=channel_layouts=stereo,adelay=1250:all=1"
+
+
+async def test_post_stream_mixes_the_clip_at_its_own_level(overlay_file_stereo: Path) -> None:
+    """The clip comes out of the mix at the level it went in, so levelling is the caller's."""
+    with wave.open(str(overlay_file_stereo)) as source:
+        source_level = _rms(_samples(source.readframes(source.getnframes()), channel=0))
+    output = b"".join(
+        await _collect_chunks(
+            get_ffmpeg_post_stream(
+                audio_input=_silence(1),
+                clip_path=str(overlay_file_stereo),
+                pcm_format=_PCM_FORMAT,
+                voice_start=0.0,
+                voice_end=1.0,
+            )
+        )
+    )
+    assert _rms(_samples(output, channel=0)) == pytest.approx(source_level, rel=0.02)
 
 
 @pytest.mark.parametrize(

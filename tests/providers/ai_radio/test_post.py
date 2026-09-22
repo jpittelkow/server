@@ -7,17 +7,16 @@ import logging
 import os
 import tempfile
 import time
+import wave
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
-from aiohttp import ClientError
 from music_assistant_models.enums import ContentType, MediaType, StreamType
-from music_assistant_models.errors import ProviderUnavailableError
+from music_assistant_models.errors import AudioError, ProviderUnavailableError
 from music_assistant_models.media_items import AudioFormat, ProviderMapping, SoundEffect, Track
 from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.streamdetails import StreamDetails
@@ -26,7 +25,6 @@ from music_assistant.controllers.streams.constants import (
     ATTR_POST_CLIP_ID,
     ATTR_POST_CLIP_OFFSET,
     ATTR_POST_END,
-    ATTR_POST_GAIN_DB,
     ATTR_POST_START,
     ATTR_POST_URL,
     POST_ATTRS,
@@ -35,15 +33,24 @@ from music_assistant.providers.ai_radio.constants import (
     ATTR_ALLOW_POST,
     POST_CLIP_MAX_AGE,
     POST_CLIP_PREFIX,
+    POST_STAGED_FORMAT,
     POST_TAIL_GAP,
+    TTS_CLIP_PCM_FORMAT,
+    TTS_PEAK_CEILING_DB,
+    TTS_SPEECHNORM_FILTER,
 )
 from music_assistant.providers.ai_radio.rendering import AIRadioRenderMixin, _ClipAudio, _PostPlan
 
 _QUEUE_ID = "player_a"
 _CLIP_ID = "sess_1"
 _MEDIA_PATH = "http://ha.invalid/api/tts_proxy/1.mp3"
-_MEDIA = cast("Any", SimpleNamespace(path=_MEDIA_PATH))
 _CLIP_FORMAT = AudioFormat(content_type=ContentType.MP3)
+_MEDIA = cast("Any", SimpleNamespace(path=_MEDIA_PATH, audio_format=_CLIP_FORMAT))
+_LEVELLING = [
+    TTS_SPEECHNORM_FILTER,
+    "volume=-2.0dB",
+    f"alimiter=limit={TTS_PEAK_CEILING_DB}dB:level=false:latency=true",
+]
 _BREAK_SECONDS = 20.0
 _VOCAL_ONSET = 12.0
 _OVERLAP = _VOCAL_ONSET - POST_TAIL_GAP
@@ -83,13 +90,12 @@ class PostRenderer(AIRadioRenderMixin):
         self.onset_lookups += 1
         return self.onset, "" if self.onset is not None else "no lyrics found"
 
-    async def _stage_post_clip(self, path: str) -> str | None:
+    async def _stage_post_clip(
+        self, path: str, input_format: AudioFormat, gain_db: float | None
+    ) -> tuple[str, float] | None:
         self.stagings += 1
         self.staged.write_bytes(b"voice")
-        return str(self.staged)
-
-    async def _precise_duration(self, path: str) -> float | None:
-        return _BREAK_SECONDS
+        return str(self.staged), _BREAK_SECONDS
 
 
 class BareRenderer(AIRadioRenderMixin):
@@ -170,7 +176,6 @@ async def test_post_is_armed_with_the_break_it_is_the_tail_of(staged: Path) -> N
         ATTR_POST_CLIP_OFFSET: pytest.approx(_HEAD),
         ATTR_POST_START: 0.0,
         ATTR_POST_END: pytest.approx(_OVERLAP),
-        ATTR_POST_GAIN_DB: -2.0,
     }
 
 
@@ -313,7 +318,8 @@ async def test_break_is_cut_where_its_record_comes_in(
 
     (call,) = ffmpeg_calls
     assert call["audio_input"] == str(staged)
-    assert call["filter_params"][0] == f"atrim=end={_HEAD:.3f}"
+    assert call["input_format"] == POST_STAGED_FORMAT
+    assert call["filter_params"] == [f"atrim=end={_HEAD:.3f}"]
     assert _post_attributes(track)[ATTR_POST_CLIP_ID] == "qi_break"
 
 
@@ -329,8 +335,8 @@ async def test_break_airs_whole_once_another_record_follows_it(
     await _produce(renderer, plan)
 
     (call,) = ffmpeg_calls
-    assert call["audio_input"] == _MEDIA_PATH
-    assert not _is_cut(call)
+    assert call["audio_input"] == str(staged)
+    assert call["filter_params"] == []
     assert _post_attributes(first) == {}
     assert _post_attributes(second) == {}
 
@@ -347,14 +353,14 @@ async def test_break_airs_whole_once_its_record_left_the_queue(
     await _produce(renderer, plan)
 
     (call,) = ffmpeg_calls
-    assert call["audio_input"] == _MEDIA_PATH
-    assert not _is_cut(call)
+    assert call["audio_input"] == str(staged)
+    assert call["filter_params"] == []
 
 
 async def test_break_airs_whole_when_its_staged_audio_is_gone(
     staged: Path, ffmpeg_calls: list[dict[str, Any]]
 ) -> None:
-    """Its tail could no longer be mixed in, so the break keeps it."""
+    """Its tail could no longer be mixed in, so the break keeps it, levelled from the source."""
     clip, track = _break_item(), _track_item("song")
     renderer = PostRenderer(staged, [clip, track])
     plan = await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=-2.0)
@@ -364,7 +370,8 @@ async def test_break_airs_whole_when_its_staged_audio_is_gone(
 
     (call,) = ffmpeg_calls
     assert call["audio_input"] == _MEDIA_PATH
-    assert not _is_cut(call)
+    assert call["input_format"] == _CLIP_FORMAT
+    assert call["filter_params"] == _LEVELLING
     assert _post_attributes(track) == {}
 
 
@@ -388,21 +395,17 @@ async def test_break_that_airs_again_is_cut_and_arms_its_record_again(
 # --- staging the rendered break ---
 
 
-def _http_session(
-    status: int = 200, body: bytes = b"voice", error: Exception | None = None, delay: float = 0.0
-) -> SimpleNamespace:
-    """Build a stand-in for the shared HTTP session that records the URLs it is asked for."""
-    requested: list[str] = []
+def _stub_render(monkeypatch: pytest.MonkeyPatch, seconds: float = 2.0) -> list[dict[str, Any]]:
+    """Stand in for the ffmpeg render of the break, yielding that many seconds of PCM."""
+    calls: list[dict[str, Any]] = []
 
-    @asynccontextmanager
-    async def get(url: str) -> AsyncGenerator[SimpleNamespace]:
-        requested.append(url)
-        await asyncio.sleep(delay)
-        if error is not None:
-            raise error
-        yield SimpleNamespace(status=status, read=AsyncMock(return_value=body))
+    async def _fake_ffmpeg_stream(**kwargs: Any) -> AsyncGenerator[bytes]:
+        calls.append(kwargs)
+        for _ in range(int(seconds * 2)):
+            yield b"\x00" * (TTS_CLIP_PCM_FORMAT.pcm_sample_size // 2)
 
-    return SimpleNamespace(get=get, requested=requested)
+    monkeypatch.setattr(f"{_RENDERING}.get_ffmpeg_stream", _fake_ffmpeg_stream)
+    return calls
 
 
 @pytest.fixture
@@ -416,53 +419,77 @@ def _staged_clips(directory: Path) -> list[Path]:
     return sorted(directory.glob(f"{POST_CLIP_PREFIX}*"))
 
 
-async def test_local_clip_is_used_where_it_is(temp_dir: Path) -> None:
-    """A clip the engine already wrote locally needs neither a fetch nor a copy."""
-    session = _http_session()
-    renderer = BareRenderer(http_session=session)
-    assert await renderer._stage_post_clip("/media/tts/clip.mp3") == "/media/tts/clip.mp3"
-    assert session.requested == []
-    assert _staged_clips(temp_dir) == []
+async def test_clip_is_rendered_once_into_a_levelled_local_copy(
+    temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One levelled render of the whole break, as a WAV both of its parts are read from."""
+    calls = _stub_render(monkeypatch, seconds=2.0)
+    renderer = BareRenderer()
 
+    staged = await renderer._stage_post_clip(_MEDIA_PATH, _CLIP_FORMAT, gain_db=-2.0)
 
-async def test_remote_clip_is_fetched_once_into_a_local_copy(temp_dir: Path) -> None:
-    """The URL is read once, when the post is armed, so playback never depends on it."""
-    session = _http_session(body=b"the whole break")
-    renderer = BareRenderer(http_session=session)
-
-    staged = await renderer._stage_post_clip(_MEDIA_PATH)
-
-    assert session.requested == [_MEDIA_PATH]
+    (call,) = calls
+    assert call["audio_input"] == _MEDIA_PATH
+    assert call["input_format"] == _CLIP_FORMAT
+    assert call["output_format"] == TTS_CLIP_PCM_FORMAT
+    assert call["filter_params"] == _LEVELLING
     assert staged is not None
-    assert _staged_clips(temp_dir) == [Path(staged)]
-    assert Path(staged).read_bytes() == b"the whole break"
+    path, seconds = staged
+    assert seconds == 2.0
+    assert _staged_clips(temp_dir) == [Path(path)]
+    with wave.open(path) as copy:
+        assert copy.getnchannels() == TTS_CLIP_PCM_FORMAT.channels
+        assert copy.getframerate() == TTS_CLIP_PCM_FORMAT.sample_rate
+        assert copy.getnframes() == 2 * TTS_CLIP_PCM_FORMAT.sample_rate
+
+
+@pytest.mark.usefixtures("temp_dir")
+async def test_clip_that_airs_as_rendered_is_copied_without_levelling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With normalization off the copy is a plain decode, as the clip would otherwise play."""
+    calls = _stub_render(monkeypatch)
+    assert await BareRenderer()._stage_post_clip(_MEDIA_PATH, _CLIP_FORMAT, gain_db=None)
+    assert calls[0]["filter_params"] == []
 
 
 @pytest.mark.parametrize(
-    "session_kwargs",
+    "failure",
     [
-        pytest.param({"status": 500}, id="server error"),
-        pytest.param({"error": ClientError("connection refused")}, id="connection error"),
-        pytest.param({"body": b""}, id="empty body"),
+        pytest.param(AudioError("ffmpeg exited with 1"), id="render failed"),
+        pytest.param(None, id="empty render"),
     ],
 )
-async def test_clip_that_cannot_be_fetched_arms_nothing(
-    temp_dir: Path, session_kwargs: dict[str, Any]
+async def test_clip_that_cannot_be_rendered_stages_nothing(
+    temp_dir: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception | None
 ) -> None:
     """Without the audio in hand there is no post, and nothing is left behind."""
-    renderer = BareRenderer(http_session=_http_session(**session_kwargs))
-    assert await renderer._stage_post_clip(_MEDIA_PATH) is None
+
+    async def _fake_ffmpeg_stream(**_kwargs: Any) -> AsyncGenerator[bytes]:
+        yield b""
+        if failure is not None:
+            raise failure
+
+    monkeypatch.setattr(f"{_RENDERING}.get_ffmpeg_stream", _fake_ffmpeg_stream)
+    assert await BareRenderer()._stage_post_clip(_MEDIA_PATH, _CLIP_FORMAT, gain_db=-2.0) is None
     assert _staged_clips(temp_dir) == []
 
 
-async def test_wedged_fetch_gives_up_instead_of_holding_up_the_break(
+async def test_wedged_render_gives_up_instead_of_holding_up_the_break(
     temp_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A fetch that never answers ends in no post, long before the break is due."""
-    monkeypatch.setattr(f"{_RENDERING}.POST_CLIP_FETCH_TIMEOUT", 0.05)
-    renderer = BareRenderer(http_session=_http_session(delay=60))
+    """A render that never finishes ends in no post, long before the break is due."""
+    monkeypatch.setattr(f"{_RENDERING}.POST_STAGE_TIMEOUT", 0.05)
+
+    async def _stalled_ffmpeg_stream(**_kwargs: Any) -> AsyncGenerator[bytes]:
+        await asyncio.sleep(60)
+        yield b""
+
+    monkeypatch.setattr(f"{_RENDERING}.get_ffmpeg_stream", _stalled_ffmpeg_stream)
     async with asyncio.timeout(5):
-        assert await renderer._stage_post_clip(_MEDIA_PATH) is None
+        assert (
+            await BareRenderer()._stage_post_clip(_MEDIA_PATH, _CLIP_FORMAT, gain_db=-2.0) is None
+        )
     assert _staged_clips(temp_dir) == []
 
 
