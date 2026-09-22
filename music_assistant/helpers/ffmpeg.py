@@ -836,9 +836,7 @@ POST_DUCK_DEPTH = 0.60  # fraction of the bed's level removed (0.60 -> -7.96 dB)
 POST_DUCK_RAMP = 0.4  # seconds, each side
 
 
-def _build_post_duck_filter(
-    voice_start: float, voice_end: float, depth: float, ramp: float
-) -> str:
+def _build_post_duck_filter(voice_start: float, voice_end: float, depth: float, ramp: float) -> str:
     """
     Build the trapezoidal volume envelope that ducks the music under a post.
 
@@ -900,7 +898,7 @@ def _build_post_mixer(
         input_args += ["-ss", f"{clip_offset:.3f}"]
     layout = _get_channel_layout_name(pcm_format.channels)
     conform = f",aformat=channel_layouts={layout}" if layout else ""
-    delay_ms = max(0, int(round(voice_start * 1000)))
+    delay_ms = max(0, round(voice_start * 1000))
     return ComplexFilter(
         # duration=first follows the music, so a clip that somehow outlives the
         # track cannot extend it
@@ -967,8 +965,16 @@ async def get_ffmpeg_post_stream(
         iterator = ffmpeg_proc.iter_chunked(chunk_size) if chunk_size else ffmpeg_proc.iter_any()
         async for chunk in iterator:
             yield chunk
+        # reap the process before trusting returncode, as the overlay stream does
         with suppress(TimeoutError):
             await ffmpeg_proc.wait_with_timeout(5)
+    if ffmpeg_proc.returncode not in (None, 0):
+        # a clip that cannot be opened ends the process before it writes anything,
+        # so without this the record it was mixed into would just go missing
+        log_tail = "\n" + "\n".join(list(ffmpeg_proc.log_history)[-5:])
+        raise AudioError(log_tail)
+    if feeder_exception := ffmpeg_proc.stdin_feeder_exception:
+        raise AudioError("Error while feeding audio to FFmpeg") from feeder_exception
 
 
 def _build_overlay_mixer(

@@ -37,12 +37,12 @@ from music_assistant.helpers.uri import create_uri
 
 from .constants import (
     AI_QUERY_TIMEOUT_SECONDS,
+    ATTR_ALLOW_POST,
     ATTR_HOST_ID,
     ATTR_MAX_CHARS,
     ATTR_PROMPT,
     ATTR_SESSION_ID,
     ATTR_STATION_ID,
-    ATTR_ALLOW_POST,
     ATTR_WEATHER_REQUIRED,
     ATTR_WEB_SEARCH_MODE,
     CONF_AI_ENGINE,

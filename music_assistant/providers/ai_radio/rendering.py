@@ -10,8 +10,8 @@ import math
 import os
 import tempfile
 import time
-
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.enums import ContentType, StreamType, VolumeNormalizationMode
@@ -20,7 +20,7 @@ from music_assistant_models.errors import (
     MediaNotFoundError,
     MusicAssistantError,
 )
-from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.media_items import AudioFormat, Track
 from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import (
@@ -40,25 +40,21 @@ from music_assistant.helpers.tts import (
     resolve_tts_stream_path,
 )
 
-from .post_window import lyric_onset
 from .constants import (
+    ATTR_ALLOW_POST,
     ATTR_HOST_ID,
     ATTR_MAX_CHARS,
-    ATTR_PROMPT,
-    ATTR_RENDERED_TEXT,
-    ATTR_SESSION_ID,
-    ATTR_WEATHER_REQUIRED,
-    ATTR_ALLOW_POST,
+    ATTR_POST_CLIP_ID,
     ATTR_POST_CLIP_OFFSET,
     ATTR_POST_END,
     ATTR_POST_GAIN_DB,
     ATTR_POST_START,
     ATTR_POST_URL,
+    ATTR_PROMPT,
+    ATTR_RENDERED_TEXT,
+    ATTR_SESSION_ID,
+    ATTR_WEATHER_REQUIRED,
     ATTR_WEB_SEARCH_MODE,
-    POST_LYRICS_TIMEOUT,
-    POST_MIN_HEAD_SECONDS,
-    POST_MIN_SECONDS,
-    POST_TAIL_GAP,
     CLIP_STREAMDETAILS_EXPIRATION,
     CONF_TTS_LOUDNESS_BOOST,
     DEFAULT_TTS_LOUDNESS_BOOST,
@@ -67,6 +63,11 @@ from .constants import (
     MIN_CLIP_MEDIA_LIFETIME,
     MIN_LOUDNESS_REFERENCE_SECONDS,
     NO_WEATHER_DATA_INSTRUCTION,
+    POST_ATTRS,
+    POST_LYRICS_TIMEOUT,
+    POST_MIN_HEAD_SECONDS,
+    POST_MIN_SECONDS,
+    POST_TAIL_GAP,
     TTS_CLIP_PCM_FORMAT,
     TTS_PEAK_CEILING_DB,
     TTS_SERVER_ERROR_MARKERS,
@@ -74,6 +75,7 @@ from .constants import (
     WEATHER_PLACEHOLDER_TOKENS,
 )
 from .helpers import coerce_int, format_ai_radio_timestamp, soft_limit_text
+from .post_window import lyric_onset
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -111,6 +113,21 @@ class _ClipAudio:
     end: float | None = None
 
 
+@dataclass(slots=True)
+class _PostPlan:
+    """How a break is split between its own queue item and the record after it."""
+
+    # seconds the break airs alone, before the record comes in underneath
+    head: float
+    # seconds of the break that are carried over the record's intro
+    overlap: float
+    # local copy of the rendered break, which both halves are read from
+    staged: str
+    # queue item of the record the carried-over part was armed on
+    track_item_id: str
+    gain_db: float
+
+
 class AIRadioRenderMixin:
     """Renders an AI Radio clip at the moment MA needs its audio."""
 
@@ -123,6 +140,7 @@ class AIRadioRenderMixin:
 
     _render_locks: dict[str, asyncio.Lock]
     _media_cache: dict[str, _CachedClipMedia]
+    _post_plans: dict[str, _PostPlan | None]
     _engine_loudness: dict[tuple[str, str, str], float]
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
@@ -168,14 +186,15 @@ class AIRadioRenderMixin:
             expiration=self._remaining_media_lifetime(media),
         )
         if post is not None:
-            head, staged = post
             # a carried-over clip always goes through get_audio_stream, because
             # that is the one place its end can be cut short - and it is served
             # from the staged copy, so head and tail are the same recording
-            streamdetails.duration = max(1, math.ceil(head))
+            streamdetails.duration = max(1, math.ceil(post.head))
             streamdetails.stream_type = StreamType.CUSTOM
             streamdetails.decoded_audio_format = replace(TTS_CLIP_PCM_FORMAT)
-            streamdetails.data = _ClipAudio(staged, media.audio_format, gain_db or 0.0, head)
+            streamdetails.data = _ClipAudio(
+                post.staged, media.audio_format, post.gain_db, post.head
+            )
         elif gain_db is not None:
             # core never normalizes a sound effect, so the clip is levelled here or it
             # airs noticeably quieter than the music around it
@@ -278,7 +297,7 @@ class AIRadioRenderMixin:
 
     async def _plan_post(
         self, queue_item: QueueItem, media: _CachedClipMedia, clip_id: str, gain_db: float
-    ) -> tuple[float, str] | None:
+    ) -> _PostPlan | None:
         """
         Decide whether a break carries over the next record, and arm that record.
 
@@ -288,8 +307,7 @@ class AIRadioRenderMixin:
         min(W, B) seconds, so one continuous voice runs straight through the
         segue and finishes as the singing starts.
 
-        Returns ``(head_seconds, staged_path)`` - how long the break airs alone,
-        and the local copy both halves are read from - or None when it airs whole.
+        Returns how the break is split, or None when it airs whole.
 
         :param queue_item: The clip about to air.
         :param media: The clip as minted.
@@ -298,17 +316,30 @@ class AIRadioRenderMixin:
         """
         if not queue_item.extra_attributes.get(ATTR_ALLOW_POST):
             return None
-        plans: dict[str, tuple[float, str] | None] = self.__dict__.setdefault(
-            "_post_plans", {}
-        )
-        if clip_id in plans:
-            # get_stream_details can be asked for the same clip more than once
-            return plans[clip_id]
-        plans[clip_id] = None
-
+        if not hasattr(self, "_post_plans"):
+            self._post_plans = {}
         next_item = self.mass.player_queues.get_next_item(
             queue_item.queue_id, queue_item.queue_item_id
         )
+        if clip_id in self._post_plans:
+            # get_stream_details can be asked for the same clip more than once, and
+            # every answer has to describe the same split
+            plan = self._post_plans[clip_id]
+            if plan is None:
+                return None
+            if (
+                next_item is not None
+                and next_item.queue_item_id == plan.track_item_id
+                and await asyncio.to_thread(Path(plan.staged).is_file)
+            ):
+                # the streams side takes a post off its record once it has aired, so
+                # a break that is about to air again has to arm that record again
+                self._arm_post(queue_item, next_item, plan)
+                return plan
+            # another record follows the break by now, or the staged audio is gone
+            self._disarm_post(queue_item, plan)
+        self._post_plans[clip_id] = None
+
         if next_item is None or next_item.media_item is None:
             self._post_skipped(queue_item.name, "no next track in the queue")
             return None
@@ -340,17 +371,8 @@ class AIRadioRenderMixin:
             return None
         head = total - overlap
 
-        # the voice is already talking when the record starts, so the record comes
-        # in underneath it from its first second rather than after a ramp
-        next_item.extra_attributes.update(
-            {
-                ATTR_POST_URL: staged,
-                ATTR_POST_CLIP_OFFSET: head,
-                ATTR_POST_START: 0.0,
-                ATTR_POST_END: overlap,
-                ATTR_POST_GAIN_DB: gain_db,
-            }
-        )
+        plan = _PostPlan(head, overlap, staged, next_item.queue_item_id, gain_db)
+        self._arm_post(queue_item, next_item, plan)
         self.logger.info(
             "AI Radio post armed on %s: break %.1fs airs alone for %.1fs, last %.1fs "
             "over the intro, vocal at %.1fs",
@@ -360,8 +382,45 @@ class AIRadioRenderMixin:
             overlap,
             onset,
         )
-        plans[clip_id] = (head, staged)
-        return plans[clip_id]
+        self._post_plans[clip_id] = plan
+        return plan
+
+    def _arm_post(self, queue_item: QueueItem, track_item: QueueItem, plan: _PostPlan) -> None:
+        """
+        Write the carried-over part of a break onto the record it airs over.
+
+        :param queue_item: The break.
+        :param track_item: The record that follows it.
+        :param plan: How the break was split.
+        """
+        # the voice is already talking when the record starts, so the record comes
+        # in underneath it from its first second rather than after a ramp
+        track_item.extra_attributes.update(
+            {
+                ATTR_POST_URL: plan.staged,
+                ATTR_POST_CLIP_ID: queue_item.queue_item_id,
+                ATTR_POST_CLIP_OFFSET: plan.head,
+                ATTR_POST_START: 0.0,
+                ATTR_POST_END: plan.overlap,
+                ATTR_POST_GAIN_DB: plan.gain_db,
+            }
+        )
+
+    def _disarm_post(self, queue_item: QueueItem, plan: _PostPlan) -> None:
+        """
+        Take a break's post off the record it was armed on, if it is still there.
+
+        :param queue_item: The break.
+        :param plan: The split that armed the record.
+        """
+        track_item = self.mass.player_queues.get_item(queue_item.queue_id, plan.track_item_id)
+        if track_item is None:
+            return
+        # another break may have armed the same record since
+        if track_item.extra_attributes.get(ATTR_POST_CLIP_ID) != queue_item.queue_item_id:
+            return
+        for key in POST_ATTRS:
+            track_item.extra_attributes.pop(key, None)
 
     # A post is armed when its clip is minted and consumed when the next track
     # starts, which can be a minute or more later. An HA tts_proxy URL does not
@@ -397,7 +456,8 @@ class AIRadioRenderMixin:
                     )
                     return None
                 audio = await response.read()
-        except Exception as err:  # noqa: BLE001 - a post must never break a clip
+        except Exception as err:
+            # a post must never break a clip
             self.logger.warning("AI Radio post clip could not be fetched: %s", err)
             return None
         if not audio:
@@ -415,18 +475,14 @@ class AIRadioRenderMixin:
     def _prune_post_clips(self) -> None:
         """Delete staged clips left behind by posts that never aired."""
         cutoff = time.time() - self.POST_CLIP_MAX_AGE
-        directory = tempfile.gettempdir()
         try:
-            names = os.listdir(directory)
+            staged_clips = list(Path(tempfile.gettempdir()).glob(f"{self.POST_CLIP_PREFIX}*"))
         except OSError:
             return
-        for name in names:
-            if not name.startswith(self.POST_CLIP_PREFIX):
-                continue
-            stale = os.path.join(directory, name)
+        for stale in staged_clips:
             try:
-                if os.path.getmtime(stale) < cutoff:
-                    os.remove(stale)
+                if stale.stat().st_mtime < cutoff:
+                    stale.unlink()
             except OSError:
                 # another pass removed it, or it is not ours to remove
                 continue
@@ -446,18 +502,17 @@ class AIRadioRenderMixin:
         :param queue_item: The upcoming track.
         """
         media_item = queue_item.media_item
-        if media_item is None:
+        if not isinstance(media_item, Track):
             return None, "no track details"
-        metadata = getattr(media_item, "metadata", None)
-        stored = getattr(metadata, "lrc_lyrics", None)
-        if onset := lyric_onset(stored):
+        if onset := lyric_onset(media_item.metadata.lrc_lyrics):
             return onset, ""
         try:
             async with asyncio.timeout(POST_LYRICS_TIMEOUT):
                 plain, lrc_lyrics = await self.mass.metadata.get_track_lyrics(media_item)
         except TimeoutError:
             return None, f"lyrics lookup took longer than {POST_LYRICS_TIMEOUT:.0f}s"
-        except Exception as err:  # noqa: BLE001 - a lyrics failure must never break a clip
+        except Exception as err:
+            # a lyrics failure must never break a clip
             return None, f"lyrics lookup failed ({err})"
         if onset := lyric_onset(lrc_lyrics):
             return onset, ""

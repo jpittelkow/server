@@ -130,10 +130,23 @@ ATTR_ALLOW_POST = "ai_radio_allow_post"
 # controllers/streams/audio.py, which cannot import from a provider. The literals
 # are duplicated there deliberately; keep the two in step.
 ATTR_POST_URL = "ai_radio_post_url"
+# the break the post is the tail of. The streams side only lets the post air when
+# that break is what went out right before the track, so a skipped break, a replay
+# or a reordered queue plays the track clean instead of airing half a sentence
+ATTR_POST_CLIP_ID = "ai_radio_post_clip_id"
 ATTR_POST_START = "ai_radio_post_start"
 ATTR_POST_END = "ai_radio_post_end"
 ATTR_POST_CLIP_OFFSET = "ai_radio_post_clip_offset"
 ATTR_POST_GAIN_DB = "ai_radio_post_gain_db"
+# everything a post puts on a record, so it can be taken off again
+POST_ATTRS = (
+    ATTR_POST_URL,
+    ATTR_POST_CLIP_ID,
+    ATTR_POST_START,
+    ATTR_POST_END,
+    ATTR_POST_CLIP_OFFSET,
+    ATTR_POST_GAIN_DB,
+)
 
 # A post is the tail of one continuous break carried over the next record's
 # intro. The break is rendered once and measured; nothing is predicted. With a
