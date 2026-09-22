@@ -137,11 +137,18 @@ POST_MIN_SECONDS = 1.5  # shortest overlap worth doing; below it the break plays
 POST_MIN_HEAD_SECONDS = 1.0  # the break keeps at least this much for its own queue item
 # MA's lyrics lookup walks every metadata provider; past this budget the break plays whole
 POST_LYRICS_TIMEOUT = 8.0
-# the rendered break is fetched once to stage it locally; a fetch this slow is a wedged one
-POST_CLIP_FETCH_TIMEOUT = 20
-# staged clips: their file name prefix, and the age past which one is a leftover to delete
+# a postable break is rendered once into a local, levelled copy; a render this slow is wedged
+POST_STAGE_TIMEOUT = 20
+# staged copies: their file name prefix, and the age past which one is a leftover to delete
 POST_CLIP_PREFIX = "ma_ai_radio_post_"
 POST_CLIP_MAX_AGE = 3600
+# the staged copy is the clip's PCM wrapped in WAV, so ffmpeg reads it without format hints
+POST_STAGED_FORMAT = AudioFormat(
+    content_type=ContentType.WAV,
+    sample_rate=TTS_CLIP_PCM_FORMAT.sample_rate,
+    bit_depth=TTS_CLIP_PCM_FORMAT.bit_depth,
+    channels=TTS_CLIP_PCM_FORMAT.channels,
+)
 
 # placeholders resolved at render time rather than at plan time, so the aired script
 # reflects the moment it plays

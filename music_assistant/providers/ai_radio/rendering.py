@@ -10,13 +10,15 @@ import math
 import os
 import tempfile
 import time
+import wave
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from aiohttp import ClientError
 from music_assistant_models.enums import ContentType, StreamType, VolumeNormalizationMode
 from music_assistant_models.errors import (
+    AudioError,
     InvalidDataError,
     MediaNotFoundError,
     MusicAssistantError,
@@ -35,7 +37,6 @@ from music_assistant.controllers.streams.constants import (
     ATTR_POST_CLIP_ID,
     ATTR_POST_CLIP_OFFSET,
     ATTR_POST_END,
-    ATTR_POST_GAIN_DB,
     ATTR_POST_START,
     ATTR_POST_URL,
     POST_ATTRS,
@@ -67,12 +68,13 @@ from .constants import (
     MIN_CLIP_MEDIA_LIFETIME,
     MIN_LOUDNESS_REFERENCE_SECONDS,
     NO_WEATHER_DATA_INSTRUCTION,
-    POST_CLIP_FETCH_TIMEOUT,
     POST_CLIP_MAX_AGE,
     POST_CLIP_PREFIX,
     POST_LYRICS_TIMEOUT,
     POST_MIN_HEAD_SECONDS,
     POST_MIN_SECONDS,
+    POST_STAGE_TIMEOUT,
+    POST_STAGED_FORMAT,
     POST_TAIL_GAP,
     TTS_CLIP_PCM_FORMAT,
     TTS_PEAK_CEILING_DB,
@@ -113,8 +115,7 @@ class _PostPlan:
 
     head: float  # seconds the break airs alone
     overlap: float  # seconds of it carried over the record's intro
-    staged: str  # local copy of the rendered break, which both parts are read from
-    gain_db: float
+    staged: str  # local levelled copy of the break, which both parts are read from
     queue_id: str
     clip_item_id: str  # the break
     track_item_id: str  # the record its tail was armed on
@@ -127,9 +128,25 @@ class _ClipAudio:
 
     path: str
     input_format: AudioFormat
-    gain_db: float
+    gain_db: float | None  # None when the clip airs as rendered
     # the planned split, if any; whether it still holds is settled when the audio is produced
     post: _PostPlan | None = None
+
+
+def _levelling_filters(gain_db: float | None) -> list[str]:
+    """
+    Return the filter chain that levels a spoken clip, empty when it airs as rendered.
+
+    :param gain_db: The trim that brings the clip to the wanted level, or None for none.
+    """
+    if gain_db is None:
+        return []
+    # speechnorm evens the clip out, the trim places it, the limiter backstops the peaks
+    return [
+        TTS_SPEECHNORM_FILTER,
+        f"volume={round(gain_db, 2)}dB",
+        f"alimiter=limit={TTS_PEAK_CEILING_DB}dB:level=false:latency=true",
+    ]
 
 
 class AIRadioRenderMixin:
@@ -171,7 +188,7 @@ class AIRadioRenderMixin:
                 self.mass.player_queues.signal_update(queue_item.queue_id, items_changed=True)
             media = await self._cached_clip_media(queue_item, text, item_id)
             gain_db = self._loudness_gain(queue_item.queue_id, media.loudness)
-            post = await self._plan_post(queue_item, media, item_id, gain_db or 0.0)
+            post = await self._plan_post(queue_item, media, item_id, gain_db)
 
         streamdetails = StreamDetails(
             provider=self.instance_id,
@@ -195,7 +212,7 @@ class AIRadioRenderMixin:
             streamdetails.duration = max(1, math.ceil(post.head))
             streamdetails.stream_type = StreamType.CUSTOM
             streamdetails.decoded_audio_format = replace(TTS_CLIP_PCM_FORMAT)
-            streamdetails.data = _ClipAudio(media.path, media.audio_format, post.gain_db, post)
+            streamdetails.data = _ClipAudio(media.path, media.audio_format, gain_db, post)
         elif gain_db is not None:
             # core never normalizes a sound effect, so the clip is levelled here or it
             # airs noticeably quieter than the music around it
@@ -216,20 +233,19 @@ class AIRadioRenderMixin:
         :param seek_position: Ignored, a spoken clip cannot be seeked.
         """
         clip = cast("_ClipAudio", streamdetails.data)
-        path = clip.path
-        filters = [
-            TTS_SPEECHNORM_FILTER,
-            f"volume={round(clip.gain_db, 2)}dB",
-            f"alimiter=limit={TTS_PEAK_CEILING_DB}dB:level=false:latency=true",
-        ]
-        # the split was planned up to a song ahead, so the break is only cut short if its
-        # tail can still air; otherwise it airs whole
-        if clip.post is not None and await self._recheck_post(clip.post):
-            path = clip.post.staged
-            filters.insert(0, f"atrim=end={clip.post.head:.3f}")
+        path, input_format = clip.path, clip.input_format
+        filters = _levelling_filters(clip.gain_db)
+        if clip.post is not None:
+            # the split was planned up to a song ahead, so the break is only cut short if its
+            # tail can still air. The staged copy is levelled already and is what the tail
+            # is read from, so the head plays from it too for as long as it exists
+            tail_airs = await self._recheck_post(clip.post)
+            if tail_airs or await asyncio.to_thread(Path(clip.post.staged).is_file):
+                path, input_format = clip.post.staged, POST_STAGED_FORMAT
+                filters = [f"atrim=end={clip.post.head:.3f}"] if tail_airs else []
         async for chunk in get_ffmpeg_stream(
             audio_input=path,
-            input_format=clip.input_format,
+            input_format=input_format,
             output_format=TTS_CLIP_PCM_FORMAT,
             filter_params=filters,
         ):
@@ -281,22 +297,12 @@ class AIRadioRenderMixin:
         # happen looks the same as one that was never enabled
         self.logger.info("AI Radio post skipped on %s: %s", item_name, reason)
 
-    async def _precise_duration(self, path: str) -> float | None:
-        """
-        Return a clip's duration in seconds, with the fraction.
-
-        :param path: Local path of the clip.
-        """
-        # _probe_duration rounds to whole seconds, too coarse to land a voice on a vocal entry
-        try:
-            tags = await async_parse_tags(path, require_duration=True)
-        except (InvalidDataError, OSError) as err:
-            self.logger.debug("AI Radio could not measure post clip %s: %s", path, err)
-            return None
-        return float(tags.duration) if tags.duration else None
-
     async def _plan_post(
-        self, queue_item: QueueItem, media: _CachedClipMedia, clip_id: str, gain_db: float
+        self,
+        queue_item: QueueItem,
+        media: _CachedClipMedia,
+        clip_id: str,
+        gain_db: float | None,
     ) -> _PostPlan | None:
         """
         Decide whether a break carries over the next record, and arm that record if so.
@@ -306,7 +312,7 @@ class AIRadioRenderMixin:
         :param queue_item: The clip about to air.
         :param media: The clip as minted.
         :param clip_id: The clip's id, so a repeat request reuses the same plan.
-        :param gain_db: The level the clip airs at, so the carried-over tail matches.
+        :param gain_db: The trim the clip airs with, or None when it airs as rendered.
         """
         if not queue_item.extra_attributes.get(ATTR_ALLOW_POST):
             return None
@@ -336,14 +342,11 @@ class AIRadioRenderMixin:
             )
             return None
 
-        staged = await self._stage_post_clip(media.path)
+        staged = await self._stage_post_clip(media.path, media.audio_format, gain_db)
         if staged is None:
-            self._post_skipped(next_item.name, "rendered audio could not be fetched")
+            self._post_skipped(next_item.name, "rendered audio could not be staged")
             return None
-        total = await self._precise_duration(staged)
-        if not total:
-            self._post_skipped(next_item.name, "rendered audio has no measurable duration")
-            return None
+        staged_path, total = staged
 
         overlap = min(window, total - POST_MIN_HEAD_SECONDS)
         if overlap < POST_MIN_SECONDS:
@@ -356,8 +359,7 @@ class AIRadioRenderMixin:
         plan = _PostPlan(
             head=head,
             overlap=overlap,
-            staged=staged,
-            gain_db=gain_db,
+            staged=staged_path,
             queue_id=queue_item.queue_id,
             clip_item_id=queue_item.queue_item_id,
             track_item_id=next_item.queue_item_id,
@@ -412,7 +414,6 @@ class AIRadioRenderMixin:
                 ATTR_POST_CLIP_OFFSET: plan.head,
                 ATTR_POST_START: 0.0,
                 ATTR_POST_END: plan.overlap,
-                ATTR_POST_GAIN_DB: plan.gain_db,
             }
         )
 
@@ -431,47 +432,61 @@ class AIRadioRenderMixin:
         for key in POST_ATTRS:
             track_item.extra_attributes.pop(key, None)
 
-    async def _stage_post_clip(self, path: str) -> str | None:
+    async def _stage_post_clip(
+        self, path: str, input_format: AudioFormat, gain_db: float | None
+    ) -> tuple[str, float] | None:
         """
-        Copy a rendered clip to a local file and return its path, or None when that failed.
+        Render a clip into a local, levelled copy and return its path and duration in seconds.
 
-        A local path is returned as is.
+        Returns None when the render failed, in which case the break airs whole.
 
         :param path: Path or URL the TTS engine returned.
+        :param input_format: The audio format of that clip.
+        :param gain_db: The trim the clip airs with, or None when it airs as rendered.
         """
-        # An HA tts_proxy url dies about 60 s after its last use, and a post airs a minute or
-        # more after it is armed - too late to re-mint, with its offsets already on the track.
-        # So the audio is fetched once now and nothing remote is touched at playback.
-        if not path.lower().startswith(("http://", "https://")):
-            return path
+        # Levelled here in one pass over the whole break, so the head and the carried-over
+        # tail share a level with no seam between them. Fetched now because an HA tts_proxy
+        # url dies about 60 s after its last use, and the tail airs a minute or more from now.
+        chunks: list[bytes] = []
         try:
             async with (
-                asyncio.timeout(POST_CLIP_FETCH_TIMEOUT),
-                self.mass.http_session.get(path) as response,
-            ):
-                if response.status != 200:
-                    self.logger.warning(
-                        "AI Radio post clip fetch returned HTTP %s; airing the break whole",
-                        response.status,
+                asyncio.timeout(POST_STAGE_TIMEOUT),
+                aclosing(
+                    get_ffmpeg_stream(
+                        audio_input=path,
+                        input_format=input_format,
+                        output_format=TTS_CLIP_PCM_FORMAT,
+                        filter_params=_levelling_filters(gain_db),
                     )
-                    return None
-                audio = await response.read()
-        except (TimeoutError, ClientError) as err:
+                ) as pcm_stream,
+            ):
+                async for chunk in pcm_stream:
+                    chunks.append(chunk)
+        except (TimeoutError, AudioError) as err:
             self.logger.warning(
-                "AI Radio post clip could not be fetched: %s", str(err) or type(err).__name__
+                "AI Radio post clip could not be staged: %s", str(err) or type(err).__name__
             )
             return None
-        if not audio:
+        pcm = b"".join(chunks)
+        if not pcm:
             return None
+        staged = await asyncio.to_thread(self._write_staged_clip, pcm)
+        return staged, len(pcm) / TTS_CLIP_PCM_FORMAT.pcm_sample_size
 
-        def _write() -> str:
-            self._prune_post_clips()
-            handle, staged = tempfile.mkstemp(prefix=POST_CLIP_PREFIX, suffix=".mp3")
-            with os.fdopen(handle, "wb") as staged_file:
-                staged_file.write(audio)
-            return staged
+    def _write_staged_clip(self, pcm: bytes) -> str:
+        """
+        Write levelled clip audio to a uniquely named WAV file and return its path.
 
-        return await asyncio.to_thread(_write)
+        :param pcm: The audio, as raw PCM in ``TTS_CLIP_PCM_FORMAT``.
+        """
+        self._prune_post_clips()
+        handle, staged = tempfile.mkstemp(prefix=POST_CLIP_PREFIX, suffix=".wav")
+        with os.fdopen(handle, "wb") as staged_file, wave.open(staged_file, "wb") as wav:
+            wav.setnchannels(TTS_CLIP_PCM_FORMAT.channels)
+            wav.setsampwidth(TTS_CLIP_PCM_FORMAT.bit_depth // 8)
+            wav.setframerate(TTS_CLIP_PCM_FORMAT.sample_rate)
+            wav.writeframes(pcm)
+        return staged
 
     def _prune_post_clips(self) -> None:
         """Delete staged clips left behind by posts that never aired."""

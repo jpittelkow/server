@@ -102,7 +102,6 @@ from music_assistant.controllers.streams.constants import (
     ATTR_POST_CLIP_ID,
     ATTR_POST_CLIP_OFFSET,
     ATTR_POST_END,
-    ATTR_POST_GAIN_DB,
     ATTR_POST_START,
     ATTR_POST_URL,
     CACHE_CATEGORY_RESOLVED_RADIO_URL,
@@ -3059,7 +3058,7 @@ class StreamsAudio:
                 async for chunk in audio_input:
                     yield chunk
             return
-        clip_url, voice_start, voice_end, clip_offset, gain_db = post
+        clip_path, voice_start, voice_end, clip_offset = post
         self.logger.debug(
             "AI Radio post on %s: voice %.2f-%.2fs", queue_item.name, voice_start, voice_end
         )
@@ -3067,12 +3066,11 @@ class StreamsAudio:
             async with aclosing(
                 get_ffmpeg_post_stream(
                     audio_input=audio_input,
-                    clip_input=clip_url,
+                    clip_path=clip_path,
                     pcm_format=pcm_format,
                     voice_start=voice_start,
                     voice_end=voice_end,
                     clip_offset=clip_offset,
-                    gain_db=gain_db,
                     chunk_size=pcm_format.pcm_sample_size,
                 )
             ) as mixed:
@@ -4908,11 +4906,9 @@ class StreamsAudio:
             return None
         return streamdetails.path
 
-    async def _resolve_post(
-        self, queue_item: QueueItem
-    ) -> tuple[str, float, float, float, float] | None:
+    async def _resolve_post(self, queue_item: QueueItem) -> tuple[str, float, float, float] | None:
         """
-        Return the post armed on a track as (clip, voice start, voice end, clip offset, gain).
+        Return the post armed on a track as (clip path, voice start, voice end, clip offset).
 
         Returns None when the track carries no post, or one that must not air with this
         playback; that one is taken off the track.
@@ -4920,10 +4916,10 @@ class StreamsAudio:
         :param queue_item: The track being streamed.
         """
         attributes = queue_item.extra_attributes
-        clip_url = str(attributes.get(ATTR_POST_URL) or "")
-        if not clip_url:
+        clip_path = str(attributes.get(ATTR_POST_URL) or "")
+        if not clip_path:
             return None
-        if (reason := await self._post_unusable_reason(queue_item, clip_url)) is not None:
+        if (reason := await self._post_unusable_reason(queue_item, clip_path)) is not None:
             # INFO to match the provider's "armed" line, so the log shows what became of it
             self.logger.info(
                 "AI Radio post on %s dropped, playing the track clean: %s", queue_item.name, reason
@@ -4933,12 +4929,7 @@ class StreamsAudio:
         try:
             numbers = [
                 float(cast("float", attributes[key]))
-                for key in (
-                    ATTR_POST_START,
-                    ATTR_POST_END,
-                    ATTR_POST_CLIP_OFFSET,
-                    ATTR_POST_GAIN_DB,
-                )
+                for key in (ATTR_POST_START, ATTR_POST_END, ATTR_POST_CLIP_OFFSET)
             ]
         except KeyError, TypeError, ValueError:
             numbers = []
@@ -4949,15 +4940,15 @@ class StreamsAudio:
             )
             self._discard_post(queue_item)
             return None
-        voice_start, voice_end, clip_offset, gain_db = numbers
-        return clip_url, voice_start, voice_end, clip_offset, gain_db
+        voice_start, voice_end, clip_offset = numbers
+        return clip_path, voice_start, voice_end, clip_offset
 
-    async def _post_unusable_reason(self, queue_item: QueueItem, clip_url: str) -> str | None:
+    async def _post_unusable_reason(self, queue_item: QueueItem, clip_path: str) -> str | None:
         """
         Return why the post on a track must not air with this playback, or None if it may.
 
         :param queue_item: The track carrying the post.
-        :param clip_url: File path or URL of the clip the post would mix in.
+        :param clip_path: Local path of the clip the post would mix in.
         """
         # last_served_item_id is reset by every explicit play, so a skipped break, a replay,
         # a restored queue and anything inserted between the break and this track all fail
@@ -4970,10 +4961,8 @@ class StreamsAudio:
         # every offset is measured from the start of the track
         if getattr(queue_item.streamdetails, "seek_position", 0):
             return "the track was seeked"
-        if not clip_url.startswith(("http://", "https://")) and not await aiofiles.os.path.isfile(
-            clip_url
-        ):
-            return f"clip {clip_url} is gone"
+        if not await aiofiles.os.path.isfile(clip_path):
+            return f"clip {clip_path} is gone"
         return None
 
     def _discard_post(self, queue_item: QueueItem) -> None:

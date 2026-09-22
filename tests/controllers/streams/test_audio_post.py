@@ -18,7 +18,6 @@ from music_assistant.controllers.streams.constants import (
     ATTR_POST_CLIP_ID,
     ATTR_POST_CLIP_OFFSET,
     ATTR_POST_END,
-    ATTR_POST_GAIN_DB,
     ATTR_POST_START,
     ATTR_POST_URL,
     POST_ATTRS,
@@ -43,7 +42,7 @@ def _make_streams_audio(last_served: str | None) -> tuple[StreamsAudio, MagicMoc
 @pytest.fixture
 def clip_file(tmp_path: Path) -> str:
     """Return the path of a staged clip that exists on disk."""
-    clip_path = tmp_path / "ma_ai_radio_post_clip.mp3"
+    clip_path = tmp_path / "ma_ai_radio_post_clip.wav"
     clip_path.write_bytes(b"voice")
     return str(clip_path)
 
@@ -56,7 +55,6 @@ def _armed_track(clip_url: str, **overrides: Any) -> QueueItem:
         ATTR_POST_CLIP_OFFSET: 7.5,
         ATTR_POST_START: 0.0,
         ATTR_POST_END: 11.6,
-        ATTR_POST_GAIN_DB: -2.0,
         "playback_speed": 1.0,
     }
     attributes.update(overrides)
@@ -136,11 +134,10 @@ async def test_post_airs_when_its_break_played_right_before(
     track = _armed_track(clip_file)
     result = await _collect(audio.get_post_mixed_stream(track, _music_stream(), _PCM_FORMAT))
     assert result == [b"mixed:" + chunk for chunk in _MUSIC_CHUNKS]
-    assert mixer_kwargs["clip_input"] == clip_file
+    assert mixer_kwargs["clip_path"] == clip_file
     assert mixer_kwargs["clip_offset"] == 7.5
     assert mixer_kwargs["voice_start"] == 0.0
     assert mixer_kwargs["voice_end"] == 11.6
-    assert mixer_kwargs["gain_db"] == -2.0
 
 
 async def test_post_comes_off_the_track_once_it_has_aired(
@@ -229,7 +226,7 @@ async def test_post_is_dropped_when_its_clip_is_gone(
     """A staged clip that no longer exists must not reach the mixer, which it would kill."""
     mixer_kwargs = _fake_mixer(monkeypatch)
     audio, _ = _make_streams_audio(last_served=_BREAK_ID)
-    track = _armed_track(str(tmp_path / "pruned.mp3"))
+    track = _armed_track(str(tmp_path / "pruned.wav"))
     result = await _collect(audio.get_post_mixed_stream(track, _music_stream(), _PCM_FORMAT))
     assert result == _MUSIC_CHUNKS
     assert mixer_kwargs == {}
@@ -241,7 +238,7 @@ async def test_post_is_dropped_when_its_clip_is_gone(
     [
         pytest.param({ATTR_POST_END: None}, id="no end"),
         pytest.param({ATTR_POST_START: "soon"}, id="unparsable start"),
-        pytest.param({ATTR_POST_GAIN_DB: "loud"}, id="unparsable gain"),
+        pytest.param({ATTR_POST_CLIP_OFFSET: "later"}, id="unparsable offset"),
         pytest.param({ATTR_POST_END: 0.0}, id="empty window"),
         pytest.param({ATTR_POST_START: -1.0}, id="negative start"),
     ],
