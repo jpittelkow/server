@@ -99,11 +99,18 @@ from music_assistant.controllers.streams.audio_processing import (
     get_normalization_details,
 )
 from music_assistant.controllers.streams.constants import (
+    ATTR_POST_CLIP_ID,
+    ATTR_POST_CLIP_OFFSET,
+    ATTR_POST_END,
+    ATTR_POST_GAIN_DB,
+    ATTR_POST_START,
+    ATTR_POST_URL,
     CACHE_CATEGORY_RESOLVED_RADIO_URL,
     CACHE_PROVIDER,
     CONF_ALLOW_CROSSFADE_SAME_ALBUM,
     DEFAULT_VOLUME_NORMALIZATION_MODE,
     OUTCOME_ONLY_NORMALIZATION_MODES,
+    POST_ATTRS,
     STREAM_SLOT_MATCH_TIMEOUT,
     STREAM_SLOT_PLAYBACK_WAIT_TIMEOUT,
     STREAM_SLOT_WAIT_TIMEOUT,
@@ -136,8 +143,6 @@ from music_assistant.helpers.audio import (
 from music_assistant.helpers.compare import compare_item_ids
 from music_assistant.helpers.dsp import ComplexFilter, filter_to_ffmpeg_params
 from music_assistant.helpers.ffmpeg import (
-    POST_DUCK_DEPTH,
-    POST_DUCK_RAMP,
     FFMpeg,
     get_ffmpeg_overlay_stream,
     get_ffmpeg_post_stream,
@@ -2658,12 +2663,9 @@ class StreamsAudio:
                         prepared_buffer=incoming_audio_buffer,
                     )
 
-                # An AI Radio post is bound to a track at an offset, so it wraps
-                # that track's own stream. Flow mode needs its own hook: the
-                # per-item path in the controller never runs for a player that
-                # takes a single continuous stream, which is most of them.
-                # As with the item stream itself, a failure must end this track
-                # rather than the whole flow.
+                # an AI Radio post is mixed into the track it was armed on, so it wraps the
+                # item stream here as well as on the per-item route. A failure ends this
+                # track, not the flow.
                 item_stream = self.get_post_mixed_stream(
                     queue_track, item_stream, pcm_format, raise_on_error=False
                 )
@@ -3029,45 +3031,6 @@ class StreamsAudio:
             # so it can handle the case where new items were added after the flow stream ended
             self.mass.player_queues.queue_buffer_completed(queue.queue_id, queue_exhausted)
 
-    # Contract with the AI Radio provider, carried on the HOST TRACK's
-    # extra_attributes (the same channel a clip already uses for its prompt):
-    #
-    #   ai_radio_post_url    str   rendered TTS clip to mix in
-    #   ai_radio_post_clip_id str  queue item id of the break this is the tail of
-    #   ai_radio_post_start  float second the voice begins, relative to the track
-    #   ai_radio_post_end    float second the voice ends
-    #   ai_radio_post_duck   float optional depth override, 0..1
-    #   ai_radio_post_ramp   float optional ramp override, seconds
-    #   ai_radio_post_clip_offset float second of the clip to start reading from
-    #   ai_radio_post_gain_db     float level to apply to the clip
-    #
-    # Deliberately a passthrough unless the required keys are present and sane:
-    # every track in the queue goes through this, so the cost of being wrong here
-    # is silence on ordinary playback.
-    #
-    # A post belongs to one airing of its break, not to the track. The track
-    # outlives it - in the queue, in the persisted queue cache, across a replay -
-    # so the post is only mixed in when its break is what went out right before
-    # this track, and it comes off the track once it has aired or no longer can.
-    POST_URL_ATTR = "ai_radio_post_url"
-    POST_CLIP_ID_ATTR = "ai_radio_post_clip_id"
-    POST_START_ATTR = "ai_radio_post_start"
-    POST_END_ATTR = "ai_radio_post_end"
-    POST_DUCK_ATTR = "ai_radio_post_duck"
-    POST_RAMP_ATTR = "ai_radio_post_ramp"
-    POST_CLIP_OFFSET_ATTR = "ai_radio_post_clip_offset"
-    POST_GAIN_ATTR = "ai_radio_post_gain_db"
-    POST_ATTRS = (
-        POST_URL_ATTR,
-        POST_CLIP_ID_ATTR,
-        POST_START_ATTR,
-        POST_END_ATTR,
-        POST_DUCK_ATTR,
-        POST_RAMP_ATTR,
-        POST_CLIP_OFFSET_ATTR,
-        POST_GAIN_ATTR,
-    )
-
     async def get_post_mixed_stream(
         self,
         queue_item: QueueItem,
@@ -3076,49 +3039,53 @@ class StreamsAudio:
         raise_on_error: bool = True,
     ) -> AsyncGenerator[bytes]:
         """
-        Mix an AI Radio post into a track's stream, if one is scheduled for it.
+        Mix an AI Radio post into a track's stream, if one is armed on it.
 
-        Returns the input untouched when the item carries no post, or when the
-        post it carries is not (or no longer) meant for this playback of it.
+        A post is the tail of the talk break before the track, mixed over the track's
+        intro with the music ducked under it. It only airs when that break is what played
+        right before, and comes off the track once it has aired. Any other input passes
+        through untouched.
 
-        :param queue_item: The item being streamed, read for post attributes.
+        :param queue_item: The item being streamed.
         :param audio_input: The track's audio (raw PCM in ``pcm_format``).
         :param pcm_format: PCM format of both the input and the mixed output.
-        :param raise_on_error: Raise when the mixer fails; when False the failure
-            is logged and the track's stream just ends.
+        :param raise_on_error: Raise when the mixer fails; when False the failure is
+            logged and the track's stream just ends.
         """
         post = await self._resolve_post(queue_item)
         if post is None:
-            # the caller can only close this wrapper, so the wrapper closes what it
-            # wraps, or an early exit leaves the decoders to the garbage collector
+            # closed here so an early exit does not leave the decoders to the garbage collector
             async with aclosing(audio_input):
                 async for chunk in audio_input:
                     yield chunk
             return
+        clip_url, voice_start, voice_end, clip_offset, gain_db = post
         self.logger.debug(
-            "AI Radio post on %s: voice %.2f-%.2fs",
-            queue_item.name,
-            post["voice_start"],
-            post["voice_end"],
+            "AI Radio post on %s: voice %.2f-%.2fs", queue_item.name, voice_start, voice_end
         )
         try:
-            async for chunk in get_ffmpeg_post_stream(
-                audio_input=audio_input,
-                pcm_format=pcm_format,
-                chunk_size=pcm_format.pcm_sample_size,
-                **post,
-            ):
-                yield chunk
+            async with aclosing(
+                get_ffmpeg_post_stream(
+                    audio_input=audio_input,
+                    clip_input=clip_url,
+                    pcm_format=pcm_format,
+                    voice_start=voice_start,
+                    voice_end=voice_end,
+                    clip_offset=clip_offset,
+                    gain_db=gain_db,
+                    chunk_size=pcm_format.pcm_sample_size,
+                )
+            ) as mixed:
+                async for chunk in mixed:
+                    yield chunk
         except AudioError as err:
             self._discard_post(queue_item)
             if raise_on_error:
                 raise
             self.logger.error("AI Radio post on %s failed to mix: %s", queue_item.name, err)
             return
-        # Only a stream that ran to its end takes the post off the track. One that
-        # was cut short leaves it armed, because a player that fetches a track
-        # twice (a probe, then the real request) still has to find it the second
-        # time - and any later, unrelated playback is turned away on the way in.
+        # a stream cut short keeps the post: a player that fetches a track twice (a probe,
+        # then the real request) still has to find it on the second request
         self._discard_post(queue_item)
 
     async def get_overlay_mixed_stream(
@@ -4941,69 +4908,66 @@ class StreamsAudio:
             return None
         return streamdetails.path
 
-    async def _resolve_post(self, queue_item: QueueItem) -> dict[str, Any] | None:
+    async def _resolve_post(
+        self, queue_item: QueueItem
+    ) -> tuple[str, float, float, float, float] | None:
         """
-        Return the mixer arguments of the post to air with this playback of a track.
+        Return the post armed on a track as (clip, voice start, voice end, clip offset, gain).
 
-        Returns None when the track carries no post. A post it does carry but that
-        must not air with this playback is taken off the track, and None returned.
+        Returns None when the track carries no post, or one that must not air with this
+        playback; that one is taken off the track.
 
         :param queue_item: The track being streamed.
         """
-        attributes = queue_item.extra_attributes or {}
-        clip_url = str(attributes.get(self.POST_URL_ATTR) or "")
+        attributes = queue_item.extra_attributes
+        clip_url = str(attributes.get(ATTR_POST_URL) or "")
         if not clip_url:
             return None
         if (reason := await self._post_unusable_reason(queue_item, clip_url)) is not None:
-            # at INFO like the provider's own "armed" line, or a log would show a
-            # post being armed and then nothing at all
+            # INFO to match the provider's "armed" line, so the log shows what became of it
             self.logger.info(
-                "AI Radio post on %s dropped, playing the track clean: %s",
-                queue_item.name,
-                reason,
+                "AI Radio post on %s dropped, playing the track clean: %s", queue_item.name, reason
             )
             self._discard_post(queue_item)
             return None
         try:
-            post: dict[str, Any] = {
-                "clip_input": clip_url,
-                "voice_start": float(attributes[self.POST_START_ATTR] or 0.0),
-                "voice_end": float(attributes[self.POST_END_ATTR] or 0.0),
-                "duck_depth": float(attributes.get(self.POST_DUCK_ATTR) or POST_DUCK_DEPTH),
-                "duck_ramp": float(attributes.get(self.POST_RAMP_ATTR) or POST_DUCK_RAMP),
-                "clip_offset": float(attributes.get(self.POST_CLIP_OFFSET_ATTR) or 0.0),
-                "gain_db": float(attributes.get(self.POST_GAIN_ATTR) or 0.0),
-            }
+            numbers = [
+                float(cast("float", attributes[key]))
+                for key in (
+                    ATTR_POST_START,
+                    ATTR_POST_END,
+                    ATTR_POST_CLIP_OFFSET,
+                    ATTR_POST_GAIN_DB,
+                )
+            ]
         except KeyError, TypeError, ValueError:
-            post = {}
-        if not post or not 0.0 <= post["voice_start"] < post["voice_end"]:
+            numbers = []
+        if not numbers or not 0.0 <= numbers[0] < numbers[1]:
             self.logger.warning(
                 "AI Radio post on %s has no usable window; playing the track clean",
                 queue_item.name,
             )
             self._discard_post(queue_item)
             return None
-        return post
+        voice_start, voice_end, clip_offset, gain_db = numbers
+        return clip_url, voice_start, voice_end, clip_offset, gain_db
 
     async def _post_unusable_reason(self, queue_item: QueueItem, clip_url: str) -> str | None:
         """
-        Return why the post on a track must not air with this playback, if so.
+        Return why the post on a track must not air with this playback, or None if it may.
 
         :param queue_item: The track carrying the post.
         :param clip_url: File path or URL of the clip the post would mix in.
         """
-        # The item whose audio last went out is reset by every explicit play, so
-        # a skipped break, a replay, a jump to this track and a restored queue all
-        # fail here, as does anything that came to sit between the break and this
-        # track. The track's own id is what a second fetch of the same playback
-        # finds there.
-        clip_id = str(queue_item.extra_attributes.get(self.POST_CLIP_ID_ATTR) or "")
+        # last_served_item_id is reset by every explicit play, so a skipped break, a replay,
+        # a restored queue and anything inserted between the break and this track all fail
+        # here. The track's own id is what a repeat fetch of the same playback finds.
+        clip_id = str(queue_item.extra_attributes.get(ATTR_POST_CLIP_ID) or "")
         queue_data = self.mass.player_queues.queue_data_or_none(queue_item.queue_id)
         last_served = queue_data.last_served_item_id if queue_data else None
         if not clip_id or last_served not in (clip_id, queue_item.queue_item_id):
             return "its break is not what played right before"
-        # every offset is measured from the start of the track, so a seek would
-        # place the voice somewhere arbitrary
+        # every offset is measured from the start of the track
         if getattr(queue_item.streamdetails, "seek_position", 0):
             return "the track was seeked"
         if not clip_url.startswith(("http://", "https://")) and not await aiofiles.os.path.isfile(
@@ -5018,7 +4982,7 @@ class StreamsAudio:
 
         :param queue_item: The track carrying the post.
         """
-        removed = [queue_item.extra_attributes.pop(key, None) for key in self.POST_ATTRS]
+        removed = [queue_item.extra_attributes.pop(key, None) for key in POST_ATTRS]
         if any(value is not None for value in removed):
             # the signal is what marks the items cache dirty and schedules the persist
             self.mass.player_queues.signal_update(queue_item.queue_id, items_changed=True)

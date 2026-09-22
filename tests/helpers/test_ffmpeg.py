@@ -21,6 +21,7 @@ from music_assistant.helpers.dsp import ComplexFilter, ComplexFilterInput
 from music_assistant.helpers.ffmpeg import (
     _INPUT_READ_ARGS,
     CACHE_ATTR_HLS_CMAF_BLOCKED,
+    POST_DUCK_DEPTH,
     FFMpeg,
     FFMpegStreamInfo,
     _build_filtergraph_args,
@@ -965,8 +966,6 @@ async def test_post_stream_ducks_the_music_only_under_the_voice(silent_clip: Pat
                 pcm_format=_PCM_FORMAT,
                 voice_start=1.5,
                 voice_end=2.5,
-                duck_depth=0.6,
-                duck_ramp=0.4,
             )
         )
     )
@@ -981,7 +980,7 @@ async def test_post_stream_ducks_the_music_only_under_the_voice(silent_clip: Pat
     before, under, after = level(0.2, 1.0), level(1.6, 2.4), level(3.1, 3.9)
     assert before == pytest.approx(8000, rel=0.02)
     assert after == pytest.approx(before, rel=0.02)
-    assert under == pytest.approx(before * 0.4, rel=0.05)
+    assert under == pytest.approx(before * (1 - POST_DUCK_DEPTH), rel=0.05)
 
 
 async def test_post_stream_raises_when_the_clip_cannot_be_opened(tmp_path: Path) -> None:
@@ -1000,7 +999,7 @@ async def test_post_stream_raises_when_the_clip_cannot_be_opened(tmp_path: Path)
 
 def test_post_duck_filter_is_fully_down_when_the_voice_leads_the_record() -> None:
     """A voice already talking at the first sample needs the ramp to start before zero."""
-    duck = _build_post_duck_filter(voice_start=0.0, voice_end=8.0, depth=0.6, ramp=0.4)
+    duck = _build_post_duck_filter(voice_start=0.0, voice_end=8.0)
     assert duck.startswith("volume=eval=frame:volume=")
     assert "(t--0.400)/0.400" in duck
     assert "(8.400-t)/0.400" in duck

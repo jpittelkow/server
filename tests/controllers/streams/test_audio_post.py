@@ -14,6 +14,15 @@ from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.queue_item import QueueItem
 
 from music_assistant.controllers.streams.audio import StreamsAudio
+from music_assistant.controllers.streams.constants import (
+    ATTR_POST_CLIP_ID,
+    ATTR_POST_CLIP_OFFSET,
+    ATTR_POST_END,
+    ATTR_POST_GAIN_DB,
+    ATTR_POST_START,
+    ATTR_POST_URL,
+    POST_ATTRS,
+)
 
 _PCM_FORMAT = AudioFormat(sample_rate=44100, bit_depth=16, channels=2)
 _MUSIC_CHUNKS = [b"chunk1", b"chunk2"]
@@ -42,12 +51,12 @@ def clip_file(tmp_path: Path) -> str:
 def _armed_track(clip_url: str, **overrides: Any) -> QueueItem:
     """Build a track carrying a post the way the AI Radio provider arms it."""
     attributes: dict[str, Any] = {
-        StreamsAudio.POST_URL_ATTR: clip_url,
-        StreamsAudio.POST_CLIP_ID_ATTR: _BREAK_ID,
-        StreamsAudio.POST_CLIP_OFFSET_ATTR: 7.5,
-        StreamsAudio.POST_START_ATTR: 0.0,
-        StreamsAudio.POST_END_ATTR: 11.6,
-        StreamsAudio.POST_GAIN_ATTR: -2.0,
+        ATTR_POST_URL: clip_url,
+        ATTR_POST_CLIP_ID: _BREAK_ID,
+        ATTR_POST_CLIP_OFFSET: 7.5,
+        ATTR_POST_START: 0.0,
+        ATTR_POST_END: 11.6,
+        ATTR_POST_GAIN_DB: -2.0,
         "playback_speed": 1.0,
     }
     attributes.update(overrides)
@@ -61,11 +70,7 @@ def _armed_track(clip_url: str, **overrides: Any) -> QueueItem:
 
 
 def _post_attributes(queue_item: QueueItem) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in queue_item.extra_attributes.items()
-        if key in StreamsAudio.POST_ATTRS
-    }
+    return {key: value for key, value in queue_item.extra_attributes.items() if key in POST_ATTRS}
 
 
 async def _music_stream() -> AsyncGenerator[bytes]:
@@ -87,12 +92,7 @@ def _fake_mixer(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 
 def _failing_mixer(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _mixer(**kwargs: Any) -> AsyncGenerator[bytes]:
-        if kwargs:
-            raise AudioError("clip could not be opened")
-        yield b""
-
-    monkeypatch.setattr(_MIXER, _mixer)
+    monkeypatch.setattr(_MIXER, MagicMock(side_effect=AudioError("clip could not be opened")))
 
 
 async def _collect(stream: AsyncGenerator[bytes]) -> list[bytes]:
@@ -166,7 +166,7 @@ async def test_post_survives_a_stream_that_is_cut_short(
     stream = audio.get_post_mixed_stream(track, _music_stream(), _PCM_FORMAT)
     assert await anext(stream) == b"mixed:" + _MUSIC_CHUNKS[0]
     await stream.aclose()
-    assert StreamsAudio.POST_URL_ATTR in track.extra_attributes
+    assert ATTR_POST_URL in track.extra_attributes
 
     # by now the track itself is the item whose audio last went out
     player_queues.queue_data_or_none.return_value = SimpleNamespace(last_served_item_id=_TRACK_ID)
@@ -202,7 +202,7 @@ async def test_post_without_a_break_id_is_dropped(
     mixer_kwargs = _fake_mixer(monkeypatch)
     audio, _ = _make_streams_audio(last_served=_TRACK_ID)
     track = _armed_track(clip_file)
-    del track.extra_attributes[StreamsAudio.POST_CLIP_ID_ATTR]
+    del track.extra_attributes[ATTR_POST_CLIP_ID]
     result = await _collect(audio.get_post_mixed_stream(track, _music_stream(), _PCM_FORMAT))
     assert result == _MUSIC_CHUNKS
     assert mixer_kwargs == {}
@@ -239,11 +239,11 @@ async def test_post_is_dropped_when_its_clip_is_gone(
 @pytest.mark.parametrize(
     "overrides",
     [
-        pytest.param({StreamsAudio.POST_END_ATTR: None}, id="no end"),
-        pytest.param({StreamsAudio.POST_START_ATTR: "soon"}, id="unparsable start"),
-        pytest.param({StreamsAudio.POST_GAIN_ATTR: "loud"}, id="unparsable gain"),
-        pytest.param({StreamsAudio.POST_END_ATTR: 0.0}, id="empty window"),
-        pytest.param({StreamsAudio.POST_START_ATTR: -1.0}, id="negative start"),
+        pytest.param({ATTR_POST_END: None}, id="no end"),
+        pytest.param({ATTR_POST_START: "soon"}, id="unparsable start"),
+        pytest.param({ATTR_POST_GAIN_DB: "loud"}, id="unparsable gain"),
+        pytest.param({ATTR_POST_END: 0.0}, id="empty window"),
+        pytest.param({ATTR_POST_START: -1.0}, id="negative start"),
     ],
 )
 async def test_post_with_an_unusable_window_is_dropped(

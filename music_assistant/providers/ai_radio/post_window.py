@@ -1,19 +1,9 @@
 """
-Vocal-onset detection for posts.
+Vocal-onset detection for posts: the second the singing starts, read from synced lyrics.
 
-A *post* is the DJ talking over a record's instrumental opening and stopping as
-the vocal arrives. Placing one needs a single fact that audio alone does not
-give cheaply: when does the singing start? :func:`lyric_onset` reads it from the
-first genuinely sung line of synced lyrics. Everything else is arithmetic on a
-measured recording, done where the clip is rendered.
-
-This is a pure function over plain strings, testable without audio, a queue or
-a network.
-
-Parsing is deliberately delegated: :func:`normalize_lrc_lyrics` already strips
-ID tags and word timings, expands multi-timestamp lines and sorts the result
-chronologically, so the only thing read here is the leading timestamp of an
-already-normalised line.
+Parsing is left to :func:`normalize_lrc_lyrics`, which strips ID tags and word timings,
+expands multi-timestamp lines and sorts the result, so only the leading timestamp of a
+normalised line is read here.
 """
 
 from __future__ import annotations
@@ -25,11 +15,9 @@ from music_assistant.helpers.lyrics import normalize_lrc_lyrics
 # the leading [mm:ss.xx] of a line that normalize_lrc_lyrics has already produced
 _LEADING_TIMESTAMP_RE = re.compile(r"^\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]\s*(.*)$")
 
-# Structural markers. A line that is only one of these - with or without
-# brackets - is scenery rather than singing and must not set the onset. The list
-# is deliberately short: a bracketed line that is NOT on it (backing vocals like
-# "(ooh ooh)", ad-libs like "(yeah!)") counts as sung, because mistaking a real
-# vocal for scenery is what puts the host on top of the singer.
+# A line that is only one of these, bracketed or not, is a section label rather than
+# singing. Kept short on purpose: a bracketed line NOT on the list ("(ooh ooh)", "(yeah!)")
+# counts as sung, because mistaking a vocal for a label puts the host on top of the singer.
 _SECTION_MARKERS = frozenset(
     {
         "intro",
@@ -90,14 +78,11 @@ def lyric_onset(lrc_lyrics: str | None) -> float | None:
     """
     Return the second at which singing starts, or None when it cannot be told.
 
-    Taking the earliest timestamp would not do: synced lyrics routinely open
-    with a zeroed header, a musical-note marker or a section label, all of which
-    sit well before the first sung word.
-
     :param lrc_lyrics: Synced lyrics in LRC format, may be None or empty.
     """
     if not (normalized := normalize_lrc_lyrics(lrc_lyrics)):
         return None
+    # the earliest timestamp is often a zeroed header, a note marker or a section label
     for line in normalized.splitlines():
         if not (match := _LEADING_TIMESTAMP_RE.match(line.strip())):
             continue
