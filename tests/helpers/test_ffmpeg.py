@@ -22,20 +22,20 @@ from music_assistant.helpers.dsp import ComplexFilter, ComplexFilterInput
 from music_assistant.helpers.ffmpeg import (
     _INPUT_READ_ARGS,
     CACHE_ATTR_HLS_CMAF_BLOCKED,
-    POST_DUCK_DEPTH,
+    VOICE_OVER_DUCK_DEPTH,
     FFMpeg,
     FFMpegStreamInfo,
     _build_filtergraph_args,
     _build_overlay_mixer,
-    _build_post_duck_filter,
-    _build_post_mixer,
+    _build_voice_over_duck_filter,
+    _build_voice_over_mixer,
     _get_overlay_volume_filter,
     check_ffmpeg_version,
     get_ffmpeg_args,
     get_ffmpeg_hls_cmaf_input_args,
     get_ffmpeg_overlay_stream,
-    get_ffmpeg_post_stream,
     get_ffmpeg_stream,
+    get_ffmpeg_voice_over_stream,
     parse_ffmpeg_duration,
     parse_ffmpeg_stream_info,
 )
@@ -890,7 +890,7 @@ def test_overlay_args_probe_the_main_input_and_add_no_filters() -> None:
     assert not any(arg.startswith(("pan=", "aresample=resampler=")) for arg in args)
 
 
-# -- get_ffmpeg_post_stream (end-to-end with a real ffmpeg process) --
+# -- get_ffmpeg_voice_over_stream (end-to-end with a real ffmpeg process) --
 
 
 async def _tone(seconds: int) -> AsyncGenerator[bytes]:
@@ -914,12 +914,12 @@ def silent_clip(tmp_path: Path) -> Path:
     return clip_path
 
 
-async def test_post_stream_says_the_clip_once_at_its_offset(overlay_file: Path) -> None:
+async def test_voice_over_stream_says_the_clip_once_at_its_offset(overlay_file: Path) -> None:
     """The clip comes in where it was placed, is not looped, and the length is kept."""
     chunks = await _collect_chunks(
-        get_ffmpeg_post_stream(
+        get_ffmpeg_voice_over_stream(
             audio_input=_silence(3),
-            clip_path=str(overlay_file),
+            voice_path=str(overlay_file),
             pcm_format=_PCM_FORMAT,
             voice_start=1.0,
             voice_end=2.0,
@@ -935,20 +935,20 @@ async def test_post_stream_says_the_clip_once_at_its_offset(overlay_file: Path) 
     assert not any(output[2 * _BYTES_PER_SECOND :])
 
 
-async def test_post_stream_reads_the_clip_from_where_its_head_stopped(
+async def test_voice_over_stream_reads_the_clip_from_where_its_head_stopped(
     overlay_file_with_silent_intro: Path,
 ) -> None:
     """The part of the clip that already aired as its own item is not said again."""
     output = b"".join(
         await _collect_chunks(
-            get_ffmpeg_post_stream(
+            get_ffmpeg_voice_over_stream(
                 audio_input=_silence(2),
                 # 1s of silence, then a 1s tone
-                clip_path=str(overlay_file_with_silent_intro),
+                voice_path=str(overlay_file_with_silent_intro),
                 pcm_format=_PCM_FORMAT,
                 voice_start=0.0,
                 voice_end=1.0,
-                clip_offset=1.0,
+                voice_offset=1.0,
             )
         )
     )
@@ -957,13 +957,13 @@ async def test_post_stream_reads_the_clip_from_where_its_head_stopped(
     assert not any(output[int(1.5 * _BYTES_PER_SECOND) :])
 
 
-async def test_post_stream_ducks_the_music_only_under_the_voice(silent_clip: Path) -> None:
+async def test_voice_over_stream_ducks_the_music_only_under_the_voice(silent_clip: Path) -> None:
     """The music drops by the duck depth while the voice is there and comes back after."""
     output = b"".join(
         await _collect_chunks(
-            get_ffmpeg_post_stream(
+            get_ffmpeg_voice_over_stream(
                 audio_input=_tone(4),
-                clip_path=str(silent_clip),
+                voice_path=str(silent_clip),
                 pcm_format=_PCM_FORMAT,
                 voice_start=1.5,
                 voice_end=2.5,
@@ -981,16 +981,16 @@ async def test_post_stream_ducks_the_music_only_under_the_voice(silent_clip: Pat
     before, under, after = level(0.2, 1.0), level(1.6, 2.4), level(3.1, 3.9)
     assert before == pytest.approx(8000, rel=0.02)
     assert after == pytest.approx(before, rel=0.02)
-    assert under == pytest.approx(before * (1 - POST_DUCK_DEPTH), rel=0.05)
+    assert under == pytest.approx(before * (1 - VOICE_OVER_DUCK_DEPTH), rel=0.05)
 
 
-async def test_post_stream_raises_when_the_clip_cannot_be_opened(tmp_path: Path) -> None:
+async def test_voice_over_stream_raises_when_the_clip_cannot_be_opened(tmp_path: Path) -> None:
     """A clip that is gone must surface as an error, not as a record that silently vanishes."""
     with pytest.raises(AudioError):
         await _collect_chunks(
-            get_ffmpeg_post_stream(
+            get_ffmpeg_voice_over_stream(
                 audio_input=_silence(1),
-                clip_path=str(tmp_path / "pruned.mp3"),
+                voice_path=str(tmp_path / "pruned.mp3"),
                 pcm_format=_PCM_FORMAT,
                 voice_start=0.0,
                 voice_end=1.0,
@@ -998,31 +998,33 @@ async def test_post_stream_raises_when_the_clip_cannot_be_opened(tmp_path: Path)
         )
 
 
-def test_post_duck_filter_is_fully_down_when_the_voice_leads_the_record() -> None:
+def test_voice_over_duck_filter_is_fully_down_when_the_voice_leads_the_record() -> None:
     """A voice already talking at the first sample needs the ramp to start before zero."""
-    duck = _build_post_duck_filter(voice_start=0.0, voice_end=8.0)
+    duck = _build_voice_over_duck_filter(voice_start=0.0, voice_end=8.0)
     assert duck.startswith("volume=eval=frame:volume=")
     assert "(t--0.400)/0.400" in duck
     assert "(8.400-t)/0.400" in duck
 
 
-def test_post_mixer_says_the_clip_once_from_its_offset() -> None:
-    """A post is never looped, is read from where its head stopped, and starts on time."""
-    (clip,) = _build_post_mixer("/clip.wav", _PCM_FORMAT, voice_start=1.25, clip_offset=7.5).inputs
+def test_voice_over_mixer_says_the_clip_once_from_its_offset() -> None:
+    """A voice-over is never looped, is read from where its head stopped, and starts on time."""
+    (clip,) = _build_voice_over_mixer(
+        "/clip.wav", _PCM_FORMAT, voice_start=1.25, voice_offset=7.5
+    ).inputs
     assert clip.input_args == ["-ss", "7.500"]
     # nothing levels the clip here: it arrives at the level it should mix in at
     assert clip.filters == "aresample=44100,aformat=channel_layouts=stereo,adelay=1250:all=1"
 
 
-async def test_post_stream_mixes_the_clip_at_its_own_level(overlay_file_stereo: Path) -> None:
+async def test_voice_over_stream_mixes_the_clip_at_its_own_level(overlay_file_stereo: Path) -> None:
     """The clip comes out of the mix at the level it went in, so levelling is the caller's."""
     with wave.open(str(overlay_file_stereo)) as source:
         source_level = _rms(_samples(source.readframes(source.getnframes()), channel=0))
     output = b"".join(
         await _collect_chunks(
-            get_ffmpeg_post_stream(
+            get_ffmpeg_voice_over_stream(
                 audio_input=_silence(1),
-                clip_path=str(overlay_file_stereo),
+                voice_path=str(overlay_file_stereo),
                 pcm_format=_PCM_FORMAT,
                 voice_start=0.0,
                 voice_end=1.0,

@@ -21,14 +21,7 @@ from music_assistant_models.media_items import AudioFormat, ProviderMapping, Sou
 from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.streamdetails import StreamDetails
 
-from music_assistant.controllers.streams.constants import (
-    ATTR_POST_CLIP_ID,
-    ATTR_POST_CLIP_OFFSET,
-    ATTR_POST_END,
-    ATTR_POST_START,
-    ATTR_POST_URL,
-    POST_ATTRS,
-)
+from music_assistant.models.plugin import VoiceOver
 from music_assistant.providers.ai_radio.constants import (
     ATTR_ALLOW_POST,
     POST_CLIP_MAX_AGE,
@@ -73,12 +66,8 @@ class PostRenderer(AIRadioRenderMixin):
         self.onset_lookups = 0
         self.stagings = 0
         cast("Any", self).mass = SimpleNamespace(
-            player_queues=SimpleNamespace(get_next_item=self._next_item, get_item=self._item)
+            player_queues=SimpleNamespace(get_next_item=self._next_item)
         )
-
-    def _item(self, queue_id: str, item_id: str) -> QueueItem | None:
-        assert queue_id == _QUEUE_ID
-        return next((item for item in self.order if item.queue_item_id == item_id), None)
 
     def _next_item(self, queue_id: str, item_id: str) -> QueueItem | None:
         assert queue_id == _QUEUE_ID
@@ -150,8 +139,22 @@ def _track_item(name: str) -> QueueItem:
     )
 
 
-def _post_attributes(queue_item: QueueItem) -> dict[str, Any]:
-    return {key: value for key, value in queue_item.extra_attributes.items() if key in POST_ATTRS}
+def _break_streamdetails(plan: _PostPlan | None = None) -> StreamDetails:
+    """Build the StreamDetails get_stream_details hands out for a break with this plan."""
+    return StreamDetails(
+        provider="ai_radio--test",
+        item_id=_CLIP_ID,
+        audio_format=_CLIP_FORMAT,
+        media_type=MediaType.SOUND_EFFECT,
+        stream_type=StreamType.CUSTOM,
+        path=_MEDIA_PATH,
+        data=_ClipAudio(_MEDIA_PATH, _CLIP_FORMAT, -2.0, plan),
+    )
+
+
+async def _voice_over(renderer: AIRadioRenderMixin, track: QueueItem) -> VoiceOver | None:
+    """Ask the renderer, as the streams side does, what the break carries over this track."""
+    return await renderer.get_voice_over(_break_streamdetails(), track)
 
 
 @pytest.fixture
@@ -163,29 +166,36 @@ def staged(tmp_path: Path) -> Path:
 # --- planning the split ---
 
 
-async def test_post_is_armed_with_the_break_it_is_the_tail_of(staged: Path) -> None:
-    """The record carries everything the streams side needs, including whose tail it is."""
+async def test_planned_post_is_handed_out_for_its_record(staged: Path) -> None:
+    """The record after the break gets the break's tail, read from where its head stops."""
     clip, track = _break_item(), _track_item("song")
     renderer = PostRenderer(staged, [clip, track])
     plan = await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=-2.0)
     assert plan is not None
     assert plan.head == pytest.approx(_HEAD)
-    assert _post_attributes(track) == {
-        ATTR_POST_URL: str(staged),
-        ATTR_POST_CLIP_ID: "qi_break",
-        ATTR_POST_CLIP_OFFSET: pytest.approx(_HEAD),
-        ATTR_POST_START: 0.0,
-        ATTR_POST_END: pytest.approx(_OVERLAP),
-    }
+    voice_over = await _voice_over(renderer, track)
+    assert voice_over is not None
+    assert voice_over.path == str(staged)
+    assert voice_over.start == 0.0
+    assert voice_over.end == pytest.approx(_OVERLAP)
+    assert voice_over.offset == pytest.approx(_HEAD)
+
+
+async def test_planned_post_leaves_the_record_itself_untouched(staged: Path) -> None:
+    """The plan stays with the provider: nothing is written onto another provider's item."""
+    clip, track = _break_item(), _track_item("song")
+    renderer = PostRenderer(staged, [clip, track])
+    await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=-2.0)
+    assert track.extra_attributes == {"playback_speed": 1.0}
 
 
 async def test_break_that_is_not_postable_is_left_alone(staged: Path) -> None:
-    """Without the opt-in nothing is looked up and nothing is armed."""
+    """Without the opt-in nothing is looked up and nothing is handed out."""
     clip, track = _break_item(allow_post=False), _track_item("song")
     renderer = PostRenderer(staged, [clip, track])
     assert await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0) is None
     assert renderer.onset_lookups == 0
-    assert _post_attributes(track) == {}
+    assert await _voice_over(renderer, track) is None
 
 
 async def test_repeat_request_gets_the_same_split(staged: Path) -> None:
@@ -208,41 +218,26 @@ async def test_break_that_cannot_post_stays_whole_on_a_repeat_request(staged: Pa
     renderer.onset = _VOCAL_ONSET
     assert await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0) is None
     assert renderer.onset_lookups == 1
-    assert _post_attributes(track) == {}
-
-
-async def test_break_airing_again_arms_its_record_again(staged: Path) -> None:
-    """The streams side takes an aired post off the record, so a replayed break re-arms it."""
-    clip, track = _break_item(), _track_item("song")
-    renderer = PostRenderer(staged, [clip, track])
-    await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=-2.0)
-    armed = _post_attributes(track)
-    for key in POST_ATTRS:
-        track.extra_attributes.pop(key, None)
-
-    await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=-2.0)
-    assert _post_attributes(track) == armed
-    assert renderer.stagings == 1
+    assert await _voice_over(renderer, track) is None
 
 
 async def test_plan_is_redone_when_another_record_follows_the_break(staged: Path) -> None:
-    """The tail moves to the record that now follows, and comes off the one that did."""
+    """The tail moves to the record that now follows, and is no longer due on the one that did."""
     clip, first, second = _break_item(), _track_item("first"), _track_item("second")
     renderer = PostRenderer(staged, [clip, first, second])
     await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
-    assert _post_attributes(first)
+    assert await _voice_over(renderer, first) is not None
 
     renderer.order = [clip, second, first]
     plan = await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
     assert plan is not None
     assert plan.track_item_id == "qi_second"
-    assert _post_attributes(second)[ATTR_POST_CLIP_ID] == "qi_break"
-    assert _post_attributes(first) == {}
-    assert first.extra_attributes == {"playback_speed": 1.0}
+    assert await _voice_over(renderer, second) is not None
+    assert await _voice_over(renderer, first) is None
 
 
 async def test_plan_is_redone_when_the_staged_clip_is_gone(staged: Path) -> None:
-    """A pruned staged clip is fetched again rather than armed as a dead path."""
+    """A pruned staged clip is fetched again rather than handed out as a dead path."""
     clip, track = _break_item(), _track_item("song")
     renderer = PostRenderer(staged, [clip, track])
     await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
@@ -252,35 +247,84 @@ async def test_plan_is_redone_when_the_staged_clip_is_gone(staged: Path) -> None
     assert plan is not None
     assert renderer.stagings == 2
     assert staged.is_file()
-    assert _post_attributes(track)[ATTR_POST_URL] == str(staged)
+    voice_over = await _voice_over(renderer, track)
+    assert voice_over is not None
+    assert voice_over.path == str(staged)
 
 
-async def test_redone_plan_leaves_a_post_armed_by_another_break(staged: Path) -> None:
-    """Only the break that armed a record may take its post off again."""
-    clip, first, second = _break_item(), _track_item("first"), _track_item("second")
-    renderer = PostRenderer(staged, [clip, first, second])
+# --- handing the tail to the streams side ---
+
+
+async def test_tail_is_only_handed_out_for_its_own_record(staged: Path) -> None:
+    """Another record, or the same record id in another queue, gets nothing."""
+    clip, track, other = _break_item(), _track_item("song"), _track_item("other")
+    renderer = PostRenderer(staged, [clip, track])
     await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
-    first.extra_attributes[ATTR_POST_CLIP_ID] = "qi_other_break"
+    elsewhere = _track_item("song")
+    elsewhere.queue_id = "player_b"
+    assert await _voice_over(renderer, other) is None
+    assert await _voice_over(renderer, elsewhere) is None
 
-    renderer.order = [clip, second, first]
+
+async def test_unknown_break_has_nothing_to_hand_out(staged: Path) -> None:
+    """A break the provider planned nothing for, such as one from before a restart, is None."""
+    renderer = PostRenderer(staged, [_break_item(), _track_item("song")])
+    assert await _voice_over(renderer, _track_item("song")) is None
+    await renderer.on_voice_over_ended(_break_streamdetails(), aired=True)
+
+
+async def test_aired_tail_is_not_handed_out_again(staged: Path) -> None:
+    """Once mixed in, the tail is gone: a replay of the record plays it clean."""
+    clip, track = _break_item(), _track_item("song")
+    renderer = PostRenderer(staged, [clip, track])
     await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
-    assert _post_attributes(first)[ATTR_POST_CLIP_ID] == "qi_other_break"
+
+    await renderer.on_voice_over_ended(_break_streamdetails(), aired=True)
+
+    assert await _voice_over(renderer, track) is None
+    assert not staged.exists()
+
+
+async def test_break_that_airs_again_after_its_tail_aired_is_planned_afresh(staged: Path) -> None:
+    """An aired plan is forgotten, so a replayed break is looked up and staged again."""
+    clip, track = _break_item(), _track_item("song")
+    renderer = PostRenderer(staged, [clip, track])
+    await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
+    await renderer.on_voice_over_ended(_break_streamdetails(), aired=True)
+
+    assert await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0) is not None
+    assert renderer.stagings == 2
+    assert await _voice_over(renderer, track) is not None
+
+
+async def test_dropped_tail_is_disarmed_but_kept_for_a_replayed_break(staged: Path) -> None:
+    """A tail that could not air stays staged, and the break airing again re-arms it."""
+    clip, track = _break_item(), _track_item("song")
+    renderer = PostRenderer(staged, [clip, track])
+    await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
+
+    await renderer.on_voice_over_ended(_break_streamdetails(), aired=False)
+    assert await _voice_over(renderer, track) is None
+    assert staged.is_file()
+
+    await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
+    assert await _voice_over(renderer, track) is not None
+    assert renderer.stagings == 1
+
+
+async def test_unload_deletes_every_staged_tail(staged: Path) -> None:
+    """Nothing staged for a post outlives the provider."""
+    clip, track = _break_item(), _track_item("song")
+    renderer = PostRenderer(staged, [clip, track])
+    await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
+
+    await renderer._discard_post_plans()
+
+    assert not staged.exists()
+    assert await _voice_over(renderer, track) is None
 
 
 # --- settling the split when the break's audio is produced ---
-
-
-def _break_streamdetails(plan: _PostPlan | None) -> StreamDetails:
-    """Build the StreamDetails get_stream_details hands out for a break with this plan."""
-    return StreamDetails(
-        provider="ai_radio--test",
-        item_id=_CLIP_ID,
-        audio_format=_CLIP_FORMAT,
-        media_type=MediaType.SOUND_EFFECT,
-        stream_type=StreamType.CUSTOM,
-        path=_MEDIA_PATH,
-        data=_ClipAudio(_MEDIA_PATH, _CLIP_FORMAT, -2.0, plan),
-    )
 
 
 @pytest.fixture
@@ -320,13 +364,13 @@ async def test_break_is_cut_where_its_record_comes_in(
     assert call["audio_input"] == str(staged)
     assert call["input_format"] == POST_STAGED_FORMAT
     assert call["filter_params"] == [f"atrim=end={_HEAD:.3f}"]
-    assert _post_attributes(track)[ATTR_POST_CLIP_ID] == "qi_break"
+    assert await _voice_over(renderer, track) is not None
 
 
 async def test_break_airs_whole_once_another_record_follows_it(
     staged: Path, ffmpeg_calls: list[dict[str, Any]]
 ) -> None:
-    """A queue change after the plan leaves the break whole, and its tail off the old record."""
+    """A queue change after the plan leaves the break whole, and its tail due on no record."""
     clip, first, second = _break_item(), _track_item("first"), _track_item("second")
     renderer = PostRenderer(staged, [clip, first, second])
     plan = await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=-2.0)
@@ -337,8 +381,8 @@ async def test_break_airs_whole_once_another_record_follows_it(
     (call,) = ffmpeg_calls
     assert call["audio_input"] == str(staged)
     assert call["filter_params"] == []
-    assert _post_attributes(first) == {}
-    assert _post_attributes(second) == {}
+    assert await _voice_over(renderer, first) is None
+    assert await _voice_over(renderer, second) is None
 
 
 async def test_break_airs_whole_once_its_record_left_the_queue(
@@ -372,24 +416,22 @@ async def test_break_airs_whole_when_its_staged_audio_is_gone(
     assert call["audio_input"] == _MEDIA_PATH
     assert call["input_format"] == _CLIP_FORMAT
     assert call["filter_params"] == _LEVELLING
-    assert _post_attributes(track) == {}
+    assert await _voice_over(renderer, track) is None
 
 
-async def test_break_that_airs_again_is_cut_and_arms_its_record_again(
+async def test_break_that_airs_again_is_cut_and_rearmed(
     staged: Path, ffmpeg_calls: list[dict[str, Any]]
 ) -> None:
-    """After its post aired and came off the record, a replayed break sets it up again."""
+    """After its tail was dropped, a replayed break is cut again and hands the tail out again."""
     clip, track = _break_item(), _track_item("song")
     renderer = PostRenderer(staged, [clip, track])
     plan = await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=-2.0)
-    armed = _post_attributes(track)
-    for key in POST_ATTRS:
-        track.extra_attributes.pop(key, None)
+    await renderer.on_voice_over_ended(_break_streamdetails(), aired=False)
 
     await _produce(renderer, plan)
 
     assert _is_cut(ffmpeg_calls[0])
-    assert _post_attributes(track) == armed
+    assert await _voice_over(renderer, track) is not None
 
 
 # --- staging the rendered break ---

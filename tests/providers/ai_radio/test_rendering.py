@@ -350,6 +350,19 @@ async def test_expired_cache_entries_are_pruned_on_the_next_mint() -> None:
     assert set(media_cache) == {"sess_002"}
 
 
+async def test_post_plans_are_pruned_with_their_expired_media() -> None:
+    """A clip whose media died can never air its planned post, so the plan goes too."""
+    renderer = _tts_renderer("http://example.test/api/tts_proxy/abc123.mp3")
+    _attach_queue(renderer, [_clip_item("sess_001"), _clip_item("sess_002")])
+
+    await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+    cast("Any", renderer)._post_plans = {"sess_001": None, "sess_003": None}
+    cast("Any", renderer)._media_cache["sess_001"].minted_at -= CLIP_STREAMDETAILS_EXPIRATION + 1
+    await renderer.get_stream_details("sess_002", MediaType.SOUND_EFFECT)
+
+    assert set(cast("Any", renderer)._post_plans) == {"sess_003"}
+
+
 async def test_render_tts_media_passes_the_locale_as_language() -> None:
     """The DJ script's locale reaches the TTS engine as a hyphenated language code."""
     renderer = _tts_renderer("http://example.test/api/tts_proxy/abc123.mp3")
