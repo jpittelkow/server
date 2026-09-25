@@ -167,19 +167,3 @@ STREAMDETAILS_INBAND_TITLE_HANDOFF_KEY: Final[str] = "inband_title_handoff"
 # stream title after an opted-in provider takes ownership of stream_metadata
 # (StreamDetails.stream_title is a derived view whose setter would overwrite it).
 STREAMDETAILS_INBAND_TITLE_KEY: Final[str] = "inband_stream_title"
-
-# QueueItem.extra_attributes keys the AI Radio provider sets on a track to have the tail of
-# the talk break before it mixed over the track's intro (a "post"). Defined here because the
-# streams controller reads them; the provider imports them from here.
-ATTR_POST_URL: Final[str] = "ai_radio_post_url"  # local path of the levelled break
-ATTR_POST_CLIP_ID: Final[str] = "ai_radio_post_clip_id"  # queue item id of that break
-ATTR_POST_START: Final[str] = "ai_radio_post_start"  # seconds into the track the voice starts
-ATTR_POST_END: Final[str] = "ai_radio_post_end"  # seconds into the track the voice ends
-ATTR_POST_CLIP_OFFSET: Final[str] = "ai_radio_post_clip_offset"  # second of the break to read from
-POST_ATTRS: Final[tuple[str, ...]] = (
-    ATTR_POST_URL,
-    ATTR_POST_CLIP_ID,
-    ATTR_POST_START,
-    ATTR_POST_END,
-    ATTR_POST_CLIP_OFFSET,
-)

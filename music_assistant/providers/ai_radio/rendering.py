@@ -33,14 +33,6 @@ from music_assistant.constants import (
     CONF_VOLUME_NORMALIZATION_TARGET,
     CONF_VOLUME_NORMALIZATION_TRACKS,
 )
-from music_assistant.controllers.streams.constants import (
-    ATTR_POST_CLIP_ID,
-    ATTR_POST_CLIP_OFFSET,
-    ATTR_POST_END,
-    ATTR_POST_START,
-    ATTR_POST_URL,
-    POST_ATTRS,
-)
 from music_assistant.helpers.audio import parse_loudnorm
 from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.helpers.process import check_output
@@ -50,6 +42,7 @@ from music_assistant.helpers.tts import (
     resolve_tts_language,
     resolve_tts_stream_path,
 )
+from music_assistant.models.plugin import VoiceOver
 
 from .constants import (
     ATTR_ALLOW_POST,
@@ -118,8 +111,11 @@ class _PostPlan:
     staged: str  # local levelled copy of the break, which both parts are read from
     queue_id: str
     clip_item_id: str  # the break
-    track_item_id: str  # the record its tail was armed on
+    track_item_id: str  # the record its tail airs over
     track_name: str
+    # whether the tail is still due to air over the record; settled when the break's audio
+    # is produced, and cleared once the streams side is done with it
+    armed: bool = True
 
 
 @dataclass(slots=True)
@@ -251,6 +247,42 @@ class AIRadioRenderMixin:
         ):
             yield chunk
 
+    async def get_voice_over(
+        self, streamdetails: StreamDetails, next_item: QueueItem
+    ) -> VoiceOver | None:
+        """
+        Return the tail of a break to mix over the record after it, if the break has one.
+
+        :param streamdetails: Stream details of the break that played right before.
+        :param next_item: The record about to stream.
+        """
+        plan = getattr(self, "_post_plans", {}).get(streamdetails.item_id)
+        if (
+            plan is None
+            or not plan.armed
+            or plan.queue_id != next_item.queue_id
+            or plan.track_item_id != next_item.queue_item_id
+        ):
+            return None
+        # start 0: the voice is already talking when the record comes in
+        return VoiceOver(path=plan.staged, start=0.0, end=plan.overlap, offset=plan.head)
+
+    async def on_voice_over_ended(self, streamdetails: StreamDetails, aired: bool) -> None:
+        """
+        Take a break's tail off its record once the streams side is done with it.
+
+        :param streamdetails: Stream details of the break the tail belongs to.
+        :param aired: Whether the tail was mixed in.
+        """
+        plans = getattr(self, "_post_plans", {})
+        if (plan := plans.get(streamdetails.item_id)) is None:
+            return
+        plan.armed = False
+        if aired:
+            # a break that airs again is planned afresh, so its staged copy is done with
+            del plans[streamdetails.item_id]
+            await asyncio.to_thread(Path(plan.staged).unlink, missing_ok=True)
+
     def _lock_for(self, clip_id: str) -> asyncio.Lock:
         """Return the per-clip render lock, creating it on first use."""
         if not hasattr(self, "_render_locks"):
@@ -283,6 +315,7 @@ class AIRadioRenderMixin:
             if now - entry.minted_at >= CLIP_STREAMDETAILS_EXPIRATION
         ]:
             del self._media_cache[expired_id]
+            getattr(self, "_post_plans", {}).pop(expired_id, None)
         self._media_cache[clip_id] = media
         return media
 
@@ -305,7 +338,7 @@ class AIRadioRenderMixin:
         gain_db: float | None,
     ) -> _PostPlan | None:
         """
-        Decide whether a break carries over the next record, and arm that record if so.
+        Decide whether a break carries over the next record.
 
         Returns how the break is split, or None when it airs whole.
 
@@ -365,7 +398,6 @@ class AIRadioRenderMixin:
             track_item_id=next_item.queue_item_id,
             track_name=next_item.name,
         )
-        self._arm_post(next_item, plan)
         self.logger.info(
             "AI Radio post armed on %s: break %.1fs airs alone for %.1fs, last %.1fs "
             "over the intro, vocal at %.1fs",
@@ -380,9 +412,7 @@ class AIRadioRenderMixin:
 
     async def _recheck_post(self, plan: _PostPlan) -> bool:
         """
-        Return whether a planned post can still air, keeping its record armed if so.
-
-        A post that can no longer air is taken off its record.
+        Return whether a planned post can still air, and arm or disarm it to match.
 
         :param plan: How the break was split.
         """
@@ -392,45 +422,12 @@ class AIRadioRenderMixin:
         elif not await asyncio.to_thread(Path(plan.staged).is_file):
             reason = "the staged audio is gone"
         else:
-            # re-armed because the streams side takes a post off its record once it has aired
-            self._arm_post(next_item, plan)
+            # re-armed because the streams side disarms a post once it is done with it
+            plan.armed = True
             return True
         self._post_skipped(plan.track_name, reason)
-        self._disarm_post(plan)
+        plan.armed = False
         return False
-
-    def _arm_post(self, track_item: QueueItem, plan: _PostPlan) -> None:
-        """
-        Write the carried-over part of a break onto the record it airs over.
-
-        :param track_item: The record that follows the break.
-        :param plan: How the break was split.
-        """
-        # start 0: the voice is already talking when the record comes in
-        track_item.extra_attributes.update(
-            {
-                ATTR_POST_URL: plan.staged,
-                ATTR_POST_CLIP_ID: plan.clip_item_id,
-                ATTR_POST_CLIP_OFFSET: plan.head,
-                ATTR_POST_START: 0.0,
-                ATTR_POST_END: plan.overlap,
-            }
-        )
-
-    def _disarm_post(self, plan: _PostPlan) -> None:
-        """
-        Take a break's post off the record it was armed on, if it is still there.
-
-        :param plan: The split that armed the record.
-        """
-        track_item = self.mass.player_queues.get_item(plan.queue_id, plan.track_item_id)
-        if track_item is None:
-            return
-        # another break may have armed the same record since
-        if track_item.extra_attributes.get(ATTR_POST_CLIP_ID) != plan.clip_item_id:
-            return
-        for key in POST_ATTRS:
-            track_item.extra_attributes.pop(key, None)
 
     async def _stage_post_clip(
         self, path: str, input_format: AudioFormat, gain_db: float | None
@@ -487,6 +484,14 @@ class AIRadioRenderMixin:
             wav.setframerate(TTS_CLIP_PCM_FORMAT.sample_rate)
             wav.writeframes(pcm)
         return staged
+
+    async def _discard_post_plans(self) -> None:
+        """Forget every planned post and delete the staged copies they were read from."""
+        plans = getattr(self, "_post_plans", {})
+        staged = [plan.staged for plan in plans.values() if plan is not None]
+        plans.clear()
+        for path in staged:
+            await asyncio.to_thread(Path(path).unlink, missing_ok=True)
 
     def _prune_post_clips(self) -> None:
         """Delete staged clips left behind by posts that never aired."""
