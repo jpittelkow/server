@@ -350,17 +350,21 @@ async def test_expired_cache_entries_are_pruned_on_the_next_mint() -> None:
     assert set(media_cache) == {"sess_002"}
 
 
-async def test_post_plans_are_pruned_with_their_expired_media() -> None:
-    """A clip whose media died can never air its planned post, so the plan goes too."""
+async def test_post_plans_are_pruned_with_their_expired_media(tmp_path: Path) -> None:
+    """A clip whose media died can never air its planned post, so the plan and copy go too."""
     renderer = _tts_renderer("http://example.test/api/tts_proxy/abc123.mp3")
     _attach_queue(renderer, [_clip_item("sess_001"), _clip_item("sess_002")])
+    staged = tmp_path / "ma_ai_radio_post_expired.wav"
+    staged.write_bytes(b"voice")
 
     await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
-    cast("Any", renderer)._post_plans = {"sess_001": None, "sess_003": None}
+    expired_plan = SimpleNamespace(staged=str(staged))
+    cast("Any", renderer)._post_plans = {"sess_001": expired_plan, "sess_003": None}
     cast("Any", renderer)._media_cache["sess_001"].minted_at -= CLIP_STREAMDETAILS_EXPIRATION + 1
     await renderer.get_stream_details("sess_002", MediaType.SOUND_EFFECT)
 
     assert set(cast("Any", renderer)._post_plans) == {"sess_003"}
+    assert not staged.exists()
 
 
 async def test_render_tts_media_passes_the_locale_as_language() -> None:

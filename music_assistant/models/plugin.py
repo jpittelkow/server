@@ -218,10 +218,11 @@ class PluginProvider(Provider):
         """
         Return speech from this plugin's item to mix over the start of the item after it.
 
-        Called when the queue item after one of this plugin's items starts streaming. The
-        music is ducked under the voice. Every voice-over handed out is settled with a call
-        to ``on_voice_over_ended``, unless the stream is cut short: a player that fetches
-        the item again then gets asked for it again.
+        Called when a queue item starts streaming straight after one of this plugin's
+        items. The voice-over's times are measured from the start of that item, which is
+        why a seeked item never gets one, and the music is ducked under the voice. Every
+        voice-over handed out is settled with a call to ``on_voice_over_ended``, unless the
+        stream is cut short: a player that fetches the item again then gets asked again.
 
         :param streamdetails: Stream details of this plugin's item, which played right before.
         :param next_item: The queue item about to stream.

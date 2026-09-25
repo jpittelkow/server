@@ -64,14 +64,11 @@ def _track_item() -> QueueItem:
 def _make_streams_audio(
     order: list[QueueItem], provider: Any, last_served: str | None = _BREAK_ID
 ) -> StreamsAudio:
-    """Build a StreamsAudio around one queue played in the given order."""
+    """Build a StreamsAudio around one queue holding the given items."""
     mass = MagicMock()
-    ids = [item.queue_item_id for item in order]
+    by_id = {item.queue_item_id: item for item in order}
     queues = mass.player_queues
-    queues.index_by_id = MagicMock(
-        side_effect=lambda _q, item_id: ids.index(item_id) if item_id in ids else None
-    )
-    queues.get_item = MagicMock(side_effect=lambda _q, index: order[index])
+    queues.get_item = MagicMock(side_effect=lambda _q, item_id: by_id.get(item_id))
     queues.queue_data_or_none = MagicMock(
         return_value=SimpleNamespace(last_served_item_id=last_served)
     )
@@ -128,11 +125,11 @@ def _mixed(audio: StreamsAudio, track: QueueItem, **kwargs: Any) -> AsyncGenerat
     return audio.get_voice_over_mixed_stream(track, _music_stream(), _PCM_FORMAT, **kwargs)
 
 
-async def test_first_item_in_the_queue_passes_through() -> None:
+async def test_item_with_nothing_served_before_it_passes_through() -> None:
     """With nothing before it there is no one to ask, and the item streams untouched."""
     track = _track_item()
     plugin = _Plugin(None)
-    audio = _make_streams_audio([track], plugin)
+    audio = _make_streams_audio([track], plugin, last_served=None)
     assert await _collect(_mixed(audio, track)) == _MUSIC_CHUNKS
     assert plugin.asked == []
 
@@ -222,6 +219,42 @@ async def test_voice_over_is_left_unsettled_by_a_stream_cut_short(
     assert plugin.ended == [("clip_1", True)]
 
 
+async def test_settled_voice_over_is_not_asked_for_on_a_later_fetch(
+    monkeypatch: pytest.MonkeyPatch, voice_file: str
+) -> None:
+    """Once settled, a fetch that finds the item itself last served has no item before."""
+    _fake_mixer(monkeypatch)
+    brk, track = _break_item(), _track_item()
+    plugin = _Plugin(_voice_over(voice_file))
+    audio = _make_streams_audio([brk, track], plugin)
+    await _collect(_mixed(audio, track))
+
+    _set_last_served(audio, _TRACK_ID)
+    assert await _collect(_mixed(audio, track)) == _MUSIC_CHUNKS
+    assert len(plugin.asked) == 1
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        pytest.param(["track", "break"], id="repeat all wraps from the break to the first item"),
+        pytest.param(["break", "unavailable", "track"], id="an unavailable item was skipped"),
+    ],
+)
+async def test_voice_over_follows_the_item_served_before_not_the_queue_index(
+    monkeypatch: pytest.MonkeyPatch, voice_file: str, order: list[str]
+) -> None:
+    """The item before is whatever played right before, wherever it sits in the queue."""
+    _fake_mixer(monkeypatch)
+    brk, track = _break_item(), _track_item()
+    unavailable = QueueItem(queue_id="queue", queue_item_id="gone", name="Gone", duration=100)
+    items = {"break": brk, "track": track, "unavailable": unavailable}
+    plugin = _Plugin(_voice_over(voice_file))
+    audio = _make_streams_audio([items[name] for name in order], plugin)
+    assert await _collect(_mixed(audio, track)) == [b"mixed:" + c for c in _MUSIC_CHUNKS]
+    assert plugin.ended == [("clip_1", True)]
+
+
 @pytest.mark.parametrize(
     "last_served",
     [
@@ -229,17 +262,18 @@ async def test_voice_over_is_left_unsettled_by_a_stream_cut_short(
         pytest.param("another_item", id="something came between the break and the track"),
     ],
 )
-async def test_voice_over_is_dropped_when_its_item_did_not_play_right_before(
+async def test_voice_over_is_not_asked_for_when_its_item_did_not_play_right_before(
     monkeypatch: pytest.MonkeyPatch, voice_file: str, last_served: str | None
 ) -> None:
-    """A voice-over never airs on a playback its item did not lead into, and is settled."""
+    """A voice-over never airs on a playback its item did not lead into."""
     mixer_kwargs = _fake_mixer(monkeypatch)
     brk, track = _break_item(), _track_item()
+    other = QueueItem(queue_id="queue", queue_item_id="another_item", name="Other", duration=9)
     plugin = _Plugin(_voice_over(voice_file))
-    audio = _make_streams_audio([brk, track], plugin, last_served=last_served)
+    audio = _make_streams_audio([brk, other, track], plugin, last_served=last_served)
     assert await _collect(_mixed(audio, track)) == _MUSIC_CHUNKS
     assert mixer_kwargs == {}
-    assert plugin.ended == [("clip_1", False)]
+    assert plugin.asked == []
 
 
 async def test_voice_over_is_dropped_on_a_seeked_item(
