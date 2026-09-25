@@ -574,6 +574,10 @@ class StreamsAudio:
         self._audio_buffer_locks: WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
             WeakValueDictionary()
         )
+        # (queue_id, queue_item_id) -> stream details of the item a voice-over for it came
+        # from, kept until the voice-over is settled. A repeat fetch of the item (a probe,
+        # then the real request) finds itself as the last item served, not its source.
+        self._voice_over_sources: dict[tuple[str, str], StreamDetails] = {}
 
     def setup(self) -> None:
         """Set up the audio sub-controller (called after all core controllers are created)."""
@@ -3069,14 +3073,14 @@ class StreamsAudio:
                 async for chunk in mixed:
                     yield chunk
         except AudioError as err:
-            await provider.on_voice_over_ended(source, aired=False)
+            await self._settle_voice_over(queue_item, provider, source, aired=False)
             if raise_on_error:
                 raise
             self.logger.error("Voice-over on %s failed to mix: %s", queue_item.name, err)
             return
         # a stream cut short leaves the voice-over unsettled: a player that fetches an item
         # twice (a probe, then the real request) still has to get it on the second request
-        await provider.on_voice_over_ended(source, aired=True)
+        await self._settle_voice_over(queue_item, provider, source, aired=True)
 
     async def get_overlay_mixed_stream(
         self,
@@ -4909,44 +4913,44 @@ class StreamsAudio:
 
         :param queue_item: The item being streamed.
         """
-        player_queues = self.mass.player_queues
-        index = player_queues.index_by_id(queue_item.queue_id, queue_item.queue_item_id)
-        if not index:
-            return None
-        previous = player_queues.get_item(queue_item.queue_id, index - 1)
-        if previous is None or (source := previous.streamdetails) is None:
+        key = (queue_item.queue_id, queue_item.queue_item_id)
+        queue_data = self.mass.player_queues.queue_data_or_none(queue_item.queue_id)
+        last_served = queue_data.last_served_item_id if queue_data else None
+        # The last item served is what played right before, following repeat and skipping
+        # unavailable items the way the queue does. Every explicit play resets it, so a
+        # skipped item, a replay or a restored queue has no item before to ask.
+        if last_served == queue_item.queue_item_id:
+            source = self._voice_over_sources.get(key)
+        else:
+            self._voice_over_sources.pop(key, None)
+            previous = self.mass.player_queues.get_item(queue_item.queue_id, last_served)
+            source = previous.streamdetails if previous else None
+        if source is None:
             return None
         provider = self.mass.get_provider(source.provider)
         if not isinstance(provider, PluginProvider):
             return None
         if (voice_over := await provider.get_voice_over(source, queue_item)) is None:
+            self._voice_over_sources.pop(key, None)
             return None
-        reason = await self._voice_over_unusable_reason(queue_item, previous, voice_over)
-        if reason is not None:
+        if (reason := await self._voice_over_unusable_reason(queue_item, voice_over)) is not None:
             self.logger.info(
                 "Voice-over on %s dropped, playing the item clean: %s", queue_item.name, reason
             )
-            await provider.on_voice_over_ended(source, aired=False)
+            await self._settle_voice_over(queue_item, provider, source, aired=False)
             return None
+        self._voice_over_sources[key] = source
         return provider, source, voice_over
 
     async def _voice_over_unusable_reason(
-        self, queue_item: QueueItem, previous: QueueItem, voice_over: VoiceOver
+        self, queue_item: QueueItem, voice_over: VoiceOver
     ) -> str | None:
         """
         Return why a voice-over must not air with this playback, or None if it may.
 
         :param queue_item: The item being streamed.
-        :param previous: The item the voice-over is carried over from.
         :param voice_over: The voice-over its plugin handed out.
         """
-        # last_served_item_id is reset by every explicit play, so a skipped item, a replay,
-        # a restored queue and anything inserted in between all fail here. The item's own
-        # id is what a repeat fetch of the same playback finds.
-        queue_data = self.mass.player_queues.queue_data_or_none(queue_item.queue_id)
-        last_served = queue_data.last_served_item_id if queue_data else None
-        if last_served not in (previous.queue_item_id, queue_item.queue_item_id):
-            return f"{previous.name} is not what played right before"
         # every offset is measured from the start of the item
         if getattr(queue_item.streamdetails, "seek_position", 0):
             return "the item was seeked"
@@ -4955,3 +4959,21 @@ class StreamsAudio:
         if not await aiofiles.os.path.isfile(voice_over.path):
             return f"{voice_over.path} is gone"
         return None
+
+    async def _settle_voice_over(
+        self,
+        queue_item: QueueItem,
+        provider: PluginProvider,
+        source: StreamDetails,
+        aired: bool,
+    ) -> None:
+        """
+        Tell a plugin its voice-over is done with, and forget where it came from.
+
+        :param queue_item: The item the voice-over was for.
+        :param provider: The plugin that handed it out.
+        :param source: Stream details of the plugin's item it came from.
+        :param aired: Whether it was mixed in.
+        """
+        self._voice_over_sources.pop((queue_item.queue_id, queue_item.queue_item_id), None)
+        await provider.on_voice_over_ended(source, aired=aired)

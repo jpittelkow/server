@@ -274,7 +274,7 @@ async def test_unknown_break_has_nothing_to_hand_out(staged: Path) -> None:
 
 
 async def test_aired_tail_is_not_handed_out_again(staged: Path) -> None:
-    """Once mixed in, the tail is gone: a replay of the record plays it clean."""
+    """Once mixed in, the tail is disarmed: a replay of the record plays it clean."""
     clip, track = _break_item(), _track_item("song")
     renderer = PostRenderer(staged, [clip, track])
     await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
@@ -282,18 +282,18 @@ async def test_aired_tail_is_not_handed_out_again(staged: Path) -> None:
     await renderer.on_voice_over_ended(_break_streamdetails(), aired=True)
 
     assert await _voice_over(renderer, track) is None
-    assert not staged.exists()
 
 
-async def test_break_that_airs_again_after_its_tail_aired_is_planned_afresh(staged: Path) -> None:
-    """An aired plan is forgotten, so a replayed break is looked up and staged again."""
+async def test_break_that_airs_again_after_its_tail_aired_carries_it_again(staged: Path) -> None:
+    """The plan and its staged copy outlive the airing, so a replayed break posts again."""
     clip, track = _break_item(), _track_item("song")
     renderer = PostRenderer(staged, [clip, track])
     await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
     await renderer.on_voice_over_ended(_break_streamdetails(), aired=True)
+    assert staged.is_file()
 
     assert await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0) is not None
-    assert renderer.stagings == 2
+    assert renderer.stagings == 1
     assert await _voice_over(renderer, track) is not None
 
 

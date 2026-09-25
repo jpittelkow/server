@@ -271,17 +271,14 @@ class AIRadioRenderMixin:
         """
         Take a break's tail off its record once the streams side is done with it.
 
+        The plan and its staged copy are kept: a break that airs again re-arms its tail when
+        its audio is produced, and both go when the break's media expires.
+
         :param streamdetails: Stream details of the break the tail belongs to.
         :param aired: Whether the tail was mixed in.
         """
-        plans = getattr(self, "_post_plans", {})
-        if (plan := plans.get(streamdetails.item_id)) is None:
-            return
-        plan.armed = False
-        if aired:
-            # a break that airs again is planned afresh, so its staged copy is done with
-            del plans[streamdetails.item_id]
-            await asyncio.to_thread(Path(plan.staged).unlink, missing_ok=True)
+        if (plan := getattr(self, "_post_plans", {}).get(streamdetails.item_id)) is not None:
+            plan.armed = False
 
     def _lock_for(self, clip_id: str) -> asyncio.Lock:
         """Return the per-clip render lock, creating it on first use."""
@@ -309,14 +306,17 @@ class AIRadioRenderMixin:
         media = _CachedClipMedia(path, stream_type, audio_format, duration, now, loudness)
         # clips are minted per queue item, so without pruning the cache grows for as long as
         # the server runs. an entry past its window can never be served again anyway
+        expired_staged: list[str] = []
         for expired_id in [
             key
             for key, entry in self._media_cache.items()
             if now - entry.minted_at >= CLIP_STREAMDETAILS_EXPIRATION
         ]:
             del self._media_cache[expired_id]
-            getattr(self, "_post_plans", {}).pop(expired_id, None)
+            if plan := getattr(self, "_post_plans", {}).pop(expired_id, None):
+                expired_staged.append(plan.staged)
         self._media_cache[clip_id] = media
+        await self._delete_staged_clips(expired_staged)
         return media
 
     def _post_skipped(self, item_name: str, reason: str) -> None:
@@ -490,7 +490,15 @@ class AIRadioRenderMixin:
         plans = getattr(self, "_post_plans", {})
         staged = [plan.staged for plan in plans.values() if plan is not None]
         plans.clear()
-        for path in staged:
+        await self._delete_staged_clips(staged)
+
+    async def _delete_staged_clips(self, paths: list[str]) -> None:
+        """
+        Delete staged post clips, off the event loop.
+
+        :param paths: The staged copies to delete; missing ones are skipped.
+        """
+        for path in paths:
             await asyncio.to_thread(Path(path).unlink, missing_ok=True)
 
     def _prune_post_clips(self) -> None:
