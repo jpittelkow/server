@@ -356,6 +356,8 @@ class AIRadioRenderMixin:
             plan = self._post_plans[clip_id]
             if plan is None or await self._recheck_post(plan):
                 return plan
+            # planned afresh below, so the copy the old split was read from is done with
+            await self._delete_staged_clips([plan.staged])
         self._post_plans[clip_id] = None
 
         next_item = self.mass.player_queues.get_next_item(
@@ -386,6 +388,7 @@ class AIRadioRenderMixin:
             self._post_skipped(
                 next_item.name, f"break is only {total:.1f}s, too short to carry over"
             )
+            await self._delete_staged_clips([staged_path])
             return None
         head = total - overlap
 
@@ -506,7 +509,8 @@ class AIRadioRenderMixin:
         cutoff = time.time() - POST_CLIP_MAX_AGE
         try:
             staged_clips = list(Path(tempfile.gettempdir()).glob(f"{POST_CLIP_PREFIX}*"))
-        except OSError:
+        except OSError as err:
+            self.logger.debug("Staged post clips could not be listed for pruning: %s", err)
             return
         for stale in staged_clips:
             try:

@@ -219,6 +219,32 @@ async def test_voice_over_is_left_unsettled_by_a_stream_cut_short(
     assert plugin.ended == [("clip_1", True)]
 
 
+async def test_source_of_a_stream_cut_short_is_replaced_by_the_next_item_served(
+    monkeypatch: pytest.MonkeyPatch, voice_file: str
+) -> None:
+    """What a queue remembers for a repeat fetch is one item, so a cut stream leaks nothing."""
+    _fake_mixer(monkeypatch)
+    brk, track = _break_item(), _track_item()
+    plugin = _Plugin(_voice_over(voice_file))
+    audio = _make_streams_audio([brk, track], plugin)
+    stream = _mixed(audio, track)
+    await anext(stream)
+    await stream.aclose()
+    sources = cast("Any", audio)._voice_over_sources
+    assert set(sources) == {"queue"}
+
+    # another break and track play; the queue's one entry now belongs to the new track
+    later_break, later_track = _break_item(), _track_item()
+    later_break.queue_item_id, later_track.queue_item_id = "break_2", "track_2"
+    audio = _make_streams_audio([later_break, later_track], plugin, last_served="break_2")
+    cast("Any", audio)._voice_over_sources = sources
+    stream = _mixed(audio, later_track)
+    await anext(stream)
+    await stream.aclose()
+    assert set(sources) == {"queue"}
+    assert sources["queue"][0] == "track_2"
+
+
 async def test_settled_voice_over_is_not_asked_for_on_a_later_fetch(
     monkeypatch: pytest.MonkeyPatch, voice_file: str
 ) -> None:

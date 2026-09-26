@@ -63,6 +63,7 @@ class PostRenderer(AIRadioRenderMixin):
         self.staged = staged
         self.order = order
         self.onset: float | None = _VOCAL_ONSET
+        self.break_seconds = _BREAK_SECONDS
         self.onset_lookups = 0
         self.stagings = 0
         cast("Any", self).mass = SimpleNamespace(
@@ -84,7 +85,7 @@ class PostRenderer(AIRadioRenderMixin):
     ) -> tuple[str, float] | None:
         self.stagings += 1
         self.staged.write_bytes(b"voice")
-        return str(self.staged), _BREAK_SECONDS
+        return str(self.staged), self.break_seconds
 
 
 class BareRenderer(AIRadioRenderMixin):
@@ -250,6 +251,34 @@ async def test_plan_is_redone_when_the_staged_clip_is_gone(staged: Path) -> None
     voice_over = await _voice_over(renderer, track)
     assert voice_over is not None
     assert voice_over.path == str(staged)
+
+
+async def test_break_too_short_to_carry_over_leaves_no_staged_copy(staged: Path) -> None:
+    """The copy is rendered before the split is known, so a split that fails deletes it."""
+    clip, track = _break_item(), _track_item("song")
+    renderer = PostRenderer(staged, [clip, track])
+    renderer.break_seconds = 2.0  # keeping 1 s for itself leaves less than the 1.5 s minimum
+
+    assert await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0) is None
+    assert renderer.stagings == 1
+    assert not staged.exists()
+
+
+async def test_replanned_break_deletes_the_copy_of_its_old_split(staged: Path) -> None:
+    """A plan redone for another record stages afresh and does not leave the old copy."""
+    clip, first, second = _break_item(), _track_item("first"), _track_item("second")
+    renderer = PostRenderer(staged, [clip, first, second])
+    await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
+    old_copy = staged.with_name("old_copy.wav")
+    staged.rename(old_copy)
+    cast("Any", renderer)._post_plans[_CLIP_ID].staged = str(old_copy)
+
+    renderer.order = [clip, second, first]
+    plan = await renderer._plan_post(clip, _MEDIA, _CLIP_ID, gain_db=0.0)
+
+    assert plan is not None
+    assert not old_copy.exists()
+    assert staged.is_file()
 
 
 # --- handing the tail to the streams side ---
