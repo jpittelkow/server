@@ -37,6 +37,11 @@ DEFAULT_MP3_BIT_RATE: Final[int] = 320
 # restores its original level. _get_channel_conform_filter avoids the same loss on the
 # main decode path by duplicating the channel instead.
 _MONO_WIDEN_COMPENSATION: Final[float] = 2**0.5
+# A voice-over is someone talking over the start of a track, such as a DJ over a record's
+# intro. The music ducks under it with a single trapezoidal `volume` expression (ramp down,
+# hold, ramp up), measured at -8 dB inside the voice and 0 dB outside it.
+VOICE_OVER_DUCK_DEPTH: Final = 0.60  # fraction of the level removed under the voice
+VOICE_OVER_DUCK_RAMP: Final = 0.4  # seconds, each side
 
 # FFmpeg applies these to the single input they precede, not to the command as a whole,
 # so every input we open has to bring its own copy.
@@ -835,14 +840,6 @@ def _get_overlay_volume_filter(overlay_volume: int, output_channels: int) -> str
     # still reports the source's own count: only a mono source is scaled up, leaving a stereo
     # one and its image untouched. Comma-free, as a comma would end this filter in the graph.
     return f"volume={gain}*{_MONO_WIDEN_COMPENSATION}^not(nb_channels-1)"
-
-
-# A voice-over is someone talking over the start of a track, such as a DJ over a record's
-# intro: the overlay mixer below, except that the clip plays once from an offset, at its
-# own level, and the music ducks under it. The duck is a single trapezoidal `volume` expression (ramp
-# down, hold, ramp up), measured at -8 dB inside the voice and 0 dB outside it.
-VOICE_OVER_DUCK_DEPTH = 0.60  # fraction of the level removed under the voice
-VOICE_OVER_DUCK_RAMP = 0.4  # seconds, each side
 
 
 def _build_voice_over_duck_filter(voice_start: float, voice_end: float) -> str:
