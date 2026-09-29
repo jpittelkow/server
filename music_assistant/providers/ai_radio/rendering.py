@@ -33,6 +33,7 @@ from music_assistant.constants import (
     CONF_VOLUME_NORMALIZATION_TARGET,
     CONF_VOLUME_NORMALIZATION_TRACKS,
 )
+from music_assistant.controllers.streams.audio_analysis import SMART_FADES_ANALYSIS_DOMAIN
 from music_assistant.helpers.audio import parse_loudnorm
 from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.helpers.process import check_output
@@ -61,6 +62,7 @@ from .constants import (
     MIN_CLIP_MEDIA_LIFETIME,
     MIN_LOUDNESS_REFERENCE_SECONDS,
     NO_WEATHER_DATA_INSTRUCTION,
+    POST_ANALYSIS_TIMEOUT,
     POST_CLIP_MAX_AGE,
     POST_CLIP_PREFIX,
     POST_LYRICS_TIMEOUT,
@@ -76,7 +78,7 @@ from .constants import (
     WEATHER_PLACEHOLDER_TOKENS,
 )
 from .helpers import coerce_int, format_ai_radio_timestamp, soft_limit_text
-from .post_window import lyric_onset
+from .post_window import audio_onset, choose_vocal_onset, lyric_onset
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -541,12 +543,30 @@ class AIRadioRenderMixin:
         media_item = queue_item.media_item
         if not isinstance(media_item, Track):
             return None, "no track details"
-        if (onset := lyric_onset(media_item.metadata.lrc_lyrics)) is not None:
+        # asked side by side, so the slower lookup alone bounds the wait
+        (lyrics, lyrics_reason), (audio, audio_reason) = await asyncio.gather(
+            self._lyrics_vocal_onset(media_item), self._audio_vocal_onset(queue_item, media_item)
+        )
+        onset = choose_vocal_onset(lyrics, audio)
+        if onset is None:
+            return None, f"{lyrics_reason}; {audio_reason}"
+        self.logger.debug(
+            "AI Radio vocal onset for %s: lyrics %s, audio %s, using %.1fs",
+            queue_item.name,
+            "none" if lyrics is None else f"{lyrics:.1f}s",
+            "none" if audio is None else f"{audio:.1f}s",
+            onset,
+        )
+        return onset, ""
+
+    async def _lyrics_vocal_onset(self, track: Track) -> tuple[float | None, str]:
+        """Return the second the vocal enters according to synced lyrics, or why there is none."""
+        if (onset := lyric_onset(track.metadata.lrc_lyrics)) is not None:
             return onset, ""
         try:
             # the lookup walks every metadata provider, longer than a clip about to air can wait
             async with asyncio.timeout(POST_LYRICS_TIMEOUT):
-                plain, lrc_lyrics = await self.mass.metadata.get_track_lyrics(media_item)
+                plain, lrc_lyrics = await self.mass.metadata.get_track_lyrics(track)
         except TimeoutError:
             return None, f"lyrics lookup took longer than {POST_LYRICS_TIMEOUT:.0f}s"
         except MusicAssistantError as err:
@@ -558,6 +578,38 @@ class AIRadioRenderMixin:
         if plain:
             return None, "only unsynced lyrics available, so no vocal timing"
         return None, "no lyrics found"
+
+    async def _audio_vocal_onset(
+        self, queue_item: QueueItem, track: Track
+    ) -> tuple[float | None, str]:
+        """Return the second the vocal enters according to stored audio analysis, or why not."""
+        # the file the queue resolved is the one that will play; otherwise every source the
+        # track is available from, best quality first, as the Smart Fades ordering reads them
+        sources: list[tuple[str, str]] = []
+        if (details := queue_item.streamdetails) is not None:
+            sources.append((details.item_id, details.provider))
+        for mapping in sorted(track.provider_mappings, key=lambda m: m.quality, reverse=True):
+            sources.append((mapping.item_id, mapping.provider_instance or mapping.provider_domain))
+        if not sources and track.item_id and track.provider:
+            sources.append((track.item_id, track.provider))
+        analysed = False
+        try:
+            # only reads what is stored; never starts an analysis for the next track
+            async with asyncio.timeout(POST_ANALYSIS_TIMEOUT):
+                for item_id, provider in dict.fromkeys(sources):
+                    analysis = await self.mass.streams.audio_analysis.get_audio_analysis(
+                        item_id, provider, priority=(SMART_FADES_ANALYSIS_DOMAIN,)
+                    )
+                    analysed = analysed or analysis is not None
+                    if (onset := audio_onset(analysis)) is not None:
+                        return onset, ""
+        except TimeoutError:
+            return None, f"audio analysis lookup took longer than {POST_ANALYSIS_TIMEOUT:.0f}s"
+        except Exception as err:
+            # the audio analysis only refines the post; its failure must never cost the clip
+            self.logger.debug("Audio analysis lookup for %s failed: %s", track.name, err)
+            return None, f"audio analysis lookup failed ({err})"
+        return None, "audio analysis has no vocal timing" if analysed else "no audio analysis"
 
     def _remaining_media_lifetime(self, media: _CachedClipMedia) -> int:
         """Return the seconds the given minted media is still usable for."""

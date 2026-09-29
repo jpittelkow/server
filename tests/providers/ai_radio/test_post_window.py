@@ -1,10 +1,32 @@
-"""Tests for reading where the singing starts from synced lyrics."""
+"""Tests for reading where the singing starts, from synced lyrics and from audio analysis."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from music_assistant.providers.ai_radio.post_window import is_sung, lyric_onset
+from music_assistant.models.audio_analysis import AudioAnalysisData
+from music_assistant.providers.ai_radio.constants import POST_AUDIO_ONSET_LEAD
+from music_assistant.providers.ai_radio.post_window import (
+    audio_onset,
+    choose_vocal_onset,
+    is_sung,
+    lyric_onset,
+)
+
+# 1800 bins over 180 s: one bin per 0.1 s
+_DURATION = 180.0
+_BINS = 1800
+
+
+def _vocal_timeline(*runs: tuple[float, float, float]) -> AudioAnalysisData:
+    """Build a stored analysis whose vocal activity is quiet except for the given runs."""
+    probabilities = [0.02] * _BINS
+    for start, end, level in runs:
+        for index in range(round(start * 10), round(end * 10)):
+            probabilities[index] = level
+    return AudioAnalysisData(duration=_DURATION, extra_data={"vocal_activity": probabilities})
 
 
 @pytest.mark.parametrize(
@@ -127,3 +149,63 @@ def test_an_untimed_line_cannot_set_the_onset() -> None:
 def test_lyrics_with_only_labels_have_no_onset() -> None:
     """An instrumental with nothing but labels and filler gives no vocal entry."""
     assert lyric_onset("[00:00.00][Intro]\n[00:20.00](Instrumental)\n[00:30.00]♪") is None
+
+
+# --- where the audio analysis first hears a voice ---
+
+
+def test_audio_onset_is_where_the_first_voice_starts() -> None:
+    """A confident, sustained run of vocal activity marks the entry."""
+    assert audio_onset(_vocal_timeline((12.0, 40.0, 0.95))) == pytest.approx(12.0)
+
+
+def test_a_weak_blip_in_the_intro_is_not_the_onset() -> None:
+    """A short run that never reaches Smart Fades' confidence gate is not a voice."""
+    analysis = _vocal_timeline((3.0, 3.5, 0.6), (12.0, 40.0, 0.95))
+    assert audio_onset(analysis) == pytest.approx(12.0)
+
+
+def test_a_timeline_without_a_voice_has_no_onset() -> None:
+    """An instrumental timeline gives no vocal entry."""
+    assert audio_onset(_vocal_timeline()) is None
+
+
+@pytest.mark.parametrize(
+    "analysis",
+    [
+        pytest.param(None, id="no analysis"),
+        pytest.param(AudioAnalysisData(duration=_DURATION), id="no timeline"),
+        pytest.param(
+            AudioAnalysisData(duration=_DURATION, extra_data={"vocal_activity": [0.9] * 100}),
+            id="wrong length",
+        ),
+        pytest.param(
+            AudioAnalysisData(extra_data={"vocal_activity": [0.9] * _BINS}), id="no duration"
+        ),
+    ],
+)
+def test_audio_onset_needs_a_valid_timeline(analysis: Any) -> None:
+    """Anything short of a validated timeline says nothing about the vocal entry."""
+    assert audio_onset(analysis) is None
+
+
+# --- choosing between the two ---
+
+
+@pytest.mark.parametrize(
+    ("lyrics", "audio", "expected"),
+    [
+        pytest.param(None, None, None, id="neither"),
+        pytest.param(7.0, None, 7.0, id="lyrics only"),
+        pytest.param(None, 12.0, 12.0, id="audio only"),
+        pytest.param(8.0, 20.0, 20.0, id="audio well after the lyrics"),
+        pytest.param(8.0, 8.0 + POST_AUDIO_ONSET_LEAD, 8.0, id="audio exactly the lead after"),
+        pytest.param(8.0, 11.0, 8.0, id="audio a little after"),
+        pytest.param(8.0, 3.0, 8.0, id="audio before the lyrics"),
+    ],
+)
+def test_the_lyrics_lead_unless_the_audio_hears_the_voice_well_after(
+    lyrics: float | None, audio: float | None, expected: float | None
+) -> None:
+    """The audio onset replaces the lyric one only when it is more than the lead later."""
+    assert choose_vocal_onset(lyrics, audio) == expected

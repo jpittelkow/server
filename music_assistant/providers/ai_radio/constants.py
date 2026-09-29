@@ -137,6 +137,13 @@ POST_MIN_SECONDS = 1.5  # shortest overlap worth doing; below it the break plays
 POST_MIN_HEAD_SECONDS = 1.0  # the break keeps at least this much for its own queue item
 # MA's lyrics lookup walks every metadata provider; past this budget the break plays whole
 POST_LYRICS_TIMEOUT = 8.0
+# the stored audio analysis is one database read, but a long maintenance query can hold the
+# library database for minutes, and the break is about to air
+POST_ANALYSIS_TIMEOUT = 2.0
+# the audio analysis replaces the lyric onset only when it hears the voice this much later.
+# In blind listening on a real library, the later of two onsets more than 5 s apart was
+# right 27 times out of 32; a smaller gap buys too little talk time to risk the first line.
+POST_AUDIO_ONSET_LEAD = 5.0
 # a postable break is rendered once into a local, levelled copy; a render this slow is wedged
 POST_STAGE_TIMEOUT = 20
 # staged copies: their file name prefix, and the age past which one is a leftover to delete

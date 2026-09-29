@@ -1,16 +1,28 @@
 """
-Vocal-onset detection for posts: the second the singing starts, read from synced lyrics.
+Vocal-onset detection for posts: the second the singing starts.
 
-Parsing is left to :func:`normalize_lrc_lyrics`, which strips ID tags and word timings,
-expands multi-timestamp lines and sorts the result, so only the leading timestamp of a
-normalised line is read here.
+Two sources can tell: synced lyrics, and the vocal-activity timeline Smart Fades stores
+with its audio analysis. Lyric parsing is left to :func:`normalize_lrc_lyrics`, which
+strips ID tags and word timings, expands multi-timestamp lines and sorts the result, so
+only the leading timestamp of a normalised line is read here.
 """
 
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
+from music_assistant.controllers.streams.smart_fades.vocal import (
+    VocalHysteresisConfig,
+    build_vocal_windows,
+    parse_vocal_probabilities,
+)
 from music_assistant.helpers.lyrics import normalize_lrc_lyrics
+
+from .constants import POST_AUDIO_ONSET_LEAD
+
+if TYPE_CHECKING:
+    from music_assistant.models.audio_analysis import AudioAnalysisData
 
 # the leading [mm:ss.xx] of a line that normalize_lrc_lyrics has already produced
 _LEADING_TIMESTAMP_RE = re.compile(r"^\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]\s*(.*)$")
@@ -55,6 +67,10 @@ _MARKER_INDEX_RE = re.compile(r"\s*[0-9ivxIVX]+\s*$")
 # symbol-only filler used for instrumental stretches
 _SYMBOL_ONLY_RE = re.compile(r"^[\s♩-♯*~\-_.·•…]+$")
 
+# Smart Fades' own hysteresis and confidence gates, without the padding it adds to protect
+# a crossfade: padding would move the onset earlier than the voice actually starts
+_ONSET_WINDOW_CONFIG = VocalHysteresisConfig(left_padding=0.0, right_padding=0.0)
+
 
 def is_sung(text: str) -> bool:
     """
@@ -97,3 +113,46 @@ def lyric_onset(lrc_lyrics: str | None) -> float | None:
         timestamp = int(match.group(1)) * 60 + float(match.group(2).replace(":", "."))
         return max(0.0, timestamp - offset_seconds)
     return None
+
+
+def audio_onset(analysis: AudioAnalysisData | None) -> float | None:
+    """
+    Return the second the audio analysis first hears a voice, or None when it cannot tell.
+
+    Reads the stored vocal-activity timeline and takes the start of its first vocal window.
+    A missing, malformed or silent timeline gives None.
+
+    :param analysis: The track's stored Smart Fades analysis, may be None.
+    """
+    if analysis is None or (timeline := parse_vocal_probabilities(analysis)) is None:
+        return None
+    # parse_vocal_probabilities only returns a timeline for a finite, positive duration
+    duration = float(analysis.duration or 0.0)
+    mask = build_vocal_windows(
+        timeline.probabilities,
+        timeline.frame_duration,
+        0.0,
+        duration,
+        config=_ONSET_WINDOW_CONFIG,
+    )
+    return mask.windows[0][0] if mask.windows else None
+
+
+def choose_vocal_onset(lyrics: float | None, audio: float | None) -> float | None:
+    """
+    Return the vocal onset a post should end before, from whichever sources have one.
+
+    The lyric onset leads; the audio onset replaces it only when it is more than
+    POST_AUDIO_ONSET_LEAD seconds later. With only one source, that one is used.
+
+    :param lyrics: Onset read from synced lyrics, or None.
+    :param audio: Onset read from the vocal-activity timeline, or None.
+    """
+    if lyrics is None:
+        return audio
+    # both sources mostly err by starting early (a credit or ad-lib line in the lyrics, a
+    # burst in the intro for the audio), so a large gap usually marks the earlier one as
+    # the false start
+    if audio is not None and audio - lyrics > POST_AUDIO_ONSET_LEAD:
+        return audio
+    return lyrics

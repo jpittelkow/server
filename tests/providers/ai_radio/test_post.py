@@ -22,6 +22,7 @@ from music_assistant_models.media_items import AudioFormat, ProviderMapping, Sou
 from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.models.plugin import VoiceOver
 from music_assistant.providers.ai_radio.constants import (
     ATTR_ALLOW_POST,
@@ -608,8 +609,25 @@ async def test_only_clips_left_by_posts_that_never_aired_are_pruned(temp_dir: Pa
 # --- finding where the singing starts ---
 
 
-def _lyrics_renderer(lookup: AsyncMock) -> BareRenderer:
-    return BareRenderer(metadata=SimpleNamespace(get_track_lyrics=lookup))
+def _lyrics_renderer(lookup: AsyncMock, analysis_lookup: AsyncMock | None = None) -> BareRenderer:
+    return BareRenderer(
+        metadata=SimpleNamespace(get_track_lyrics=lookup),
+        streams=SimpleNamespace(
+            audio_analysis=SimpleNamespace(
+                get_audio_analysis=analysis_lookup or AsyncMock(return_value=None)
+            )
+        ),
+    )
+
+
+def _vocal_analysis(onset: float | None) -> AudioAnalysisData:
+    """Build a stored Smart Fades analysis whose voice enters at the given second."""
+    probabilities = [0.02] * 1800
+    if onset is not None:
+        # 1800 bins over 180 s: one bin per 0.1 s
+        for index in range(round(onset * 10), 1800):
+            probabilities[index] = 0.95
+    return AudioAnalysisData(duration=180.0, extra_data={"vocal_activity": probabilities})
 
 
 def _track_with_lyrics(lrc_lyrics: str | None) -> QueueItem:
@@ -665,7 +683,10 @@ async def test_lyrics_without_vocal_timing_say_why(
 ) -> None:
     """Each way of coming up empty is logged with its own reason."""
     renderer = _lyrics_renderer(AsyncMock(return_value=found))
-    assert await renderer._resolve_vocal_onset(_track_with_lyrics(None)) == (None, reason)
+    assert await renderer._resolve_vocal_onset(_track_with_lyrics(None)) == (
+        None,
+        f"{reason}; no audio analysis",
+    )
 
 
 async def test_failing_lyrics_lookup_says_why() -> None:
@@ -673,7 +694,7 @@ async def test_failing_lyrics_lookup_says_why() -> None:
     renderer = _lyrics_renderer(AsyncMock(side_effect=ProviderUnavailableError("provider down")))
     assert await renderer._resolve_vocal_onset(_track_with_lyrics(None)) == (
         None,
-        "lyrics lookup failed (provider down)",
+        "lyrics lookup failed (provider down); no audio analysis",
     )
 
 
@@ -696,3 +717,107 @@ async def test_item_that_is_not_a_track_has_no_vocal_onset() -> None:
     """Only a track has lyrics to read the vocal entry from."""
     renderer = _lyrics_renderer(AsyncMock())
     assert await renderer._resolve_vocal_onset(_break_item()) == (None, "no track details")
+
+
+# --- the audio analysis as a second source ---
+
+
+async def test_audio_analysis_times_a_track_without_lyrics() -> None:
+    """With no lyrics at all, the stored vocal timeline alone places the entry."""
+    renderer = _lyrics_renderer(
+        AsyncMock(return_value=(None, None)), AsyncMock(return_value=_vocal_analysis(14.0))
+    )
+    onset, reason = await renderer._resolve_vocal_onset(_track_with_lyrics(None))
+    assert onset == pytest.approx(14.0)
+    assert reason == ""
+
+
+@pytest.mark.parametrize(
+    ("audio", "expected"),
+    [
+        pytest.param(20.0, 20.0, id="audio well after the lyrics"),
+        pytest.param(11.0, 8.0, id="audio a little after"),
+        pytest.param(3.0, 8.0, id="audio before the lyrics"),
+        pytest.param(None, 8.0, id="audio hears no voice"),
+    ],
+)
+async def test_audio_onset_takes_over_only_well_after_the_lyrics(
+    audio: float | None, expected: float
+) -> None:
+    """Stored lyrics lead; the audio analysis moves the entry only when it is much later."""
+    renderer = _lyrics_renderer(AsyncMock(), AsyncMock(return_value=_vocal_analysis(audio)))
+    onset, _reason = await renderer._resolve_vocal_onset(_track_with_lyrics("[00:08.00]Line"))
+    assert onset == pytest.approx(expected)
+
+
+async def test_the_resolved_stream_is_asked_before_the_mappings() -> None:
+    """The file the queue already resolved is the one that plays, so its analysis comes first."""
+    analysis_lookup = AsyncMock(return_value=None)
+    renderer = _lyrics_renderer(AsyncMock(return_value=(None, None)), analysis_lookup)
+    track = _track_with_lyrics(None)
+    track.streamdetails = StreamDetails(
+        provider="fs_other",
+        item_id="resolved.flac",
+        audio_format=AudioFormat(content_type=ContentType.FLAC),
+        media_type=MediaType.TRACK,
+        stream_type=StreamType.LOCAL_FILE,
+        path="/music/resolved.flac",
+    )
+    assert await renderer._resolve_vocal_onset(track) == (
+        None,
+        "no lyrics found; no audio analysis",
+    )
+    asked = [call.args[:2] for call in analysis_lookup.await_args_list]
+    assert asked == [("resolved.flac", "fs_other"), ("song", "fs")]
+
+
+async def test_a_copy_without_a_timeline_does_not_hide_one_with_it() -> None:
+    """An analysed copy that carries no vocal timeline gives way to one that does."""
+    analysis_lookup = AsyncMock(
+        side_effect=[AudioAnalysisData(duration=180.0), _vocal_analysis(9.0)]
+    )
+    renderer = _lyrics_renderer(AsyncMock(return_value=(None, None)), analysis_lookup)
+    track = _track_with_lyrics(None)
+    track.streamdetails = StreamDetails(
+        provider="fs_other",
+        item_id="resolved.flac",
+        audio_format=AudioFormat(content_type=ContentType.FLAC),
+        media_type=MediaType.TRACK,
+        stream_type=StreamType.LOCAL_FILE,
+        path="/music/resolved.flac",
+    )
+    onset, _reason = await renderer._resolve_vocal_onset(track)
+    assert onset == pytest.approx(9.0)
+
+
+async def test_analysis_without_a_voice_says_so() -> None:
+    """A timeline that never hears a voice is reported apart from a missing analysis."""
+    renderer = _lyrics_renderer(
+        AsyncMock(return_value=(None, None)), AsyncMock(return_value=_vocal_analysis(None))
+    )
+    assert await renderer._resolve_vocal_onset(_track_with_lyrics(None)) == (
+        None,
+        "no lyrics found; audio analysis has no vocal timing",
+    )
+
+
+async def test_slow_audio_analysis_falls_back_to_the_lyrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A database held by a long query must not hold up a break about to air."""
+    monkeypatch.setattr(f"{_RENDERING}.POST_ANALYSIS_TIMEOUT", 0.05)
+
+    async def _slow_analysis(*_args: Any, **_kwargs: Any) -> AudioAnalysisData:
+        await asyncio.sleep(60)
+        return _vocal_analysis(30.0)
+
+    renderer = _lyrics_renderer(AsyncMock(), AsyncMock(side_effect=_slow_analysis))
+    async with asyncio.timeout(5):
+        onset, _reason = await renderer._resolve_vocal_onset(_track_with_lyrics("[00:08.00]Line"))
+    assert onset == 8.0
+
+
+async def test_failing_audio_analysis_costs_only_the_audio() -> None:
+    """An analysis lookup that errors leaves the lyric onset to time the post."""
+    renderer = _lyrics_renderer(AsyncMock(), AsyncMock(side_effect=RuntimeError("database gone")))
+    assert await renderer._resolve_vocal_onset(_track_with_lyrics("[00:08.00]Line")) == (8.0, "")
