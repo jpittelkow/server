@@ -13,7 +13,7 @@ import re
 from typing import TYPE_CHECKING
 
 from music_assistant.controllers.streams.smart_fades.vocal import (
-    VocalHysteresisConfig,
+    PROTECTIVE_VOCAL_CONFIG,
     build_vocal_windows,
     parse_vocal_probabilities,
 )
@@ -66,10 +66,6 @@ _MARKER_INDEX_RE = re.compile(r"\s*[0-9ivxIVX]+\s*$")
 
 # symbol-only filler used for instrumental stretches
 _SYMBOL_ONLY_RE = re.compile(r"^[\s♩-♯*~\-_.·•…]+$")
-
-# Smart Fades' own hysteresis and confidence gates, without the padding it adds to protect
-# a crossfade: padding would move the onset earlier than the voice actually starts
-_ONSET_WINDOW_CONFIG = VocalHysteresisConfig(left_padding=0.0, right_padding=0.0)
 
 
 def is_sung(text: str) -> bool:
@@ -133,7 +129,9 @@ def audio_onset(analysis: AudioAnalysisData | None) -> float | None:
         timeline.frame_duration,
         0.0,
         duration,
-        config=_ONSET_WINDOW_CONFIG,
+        beat_duration=60.0 / analysis.bpm if analysis.bpm and analysis.bpm > 0.0 else None,
+        # the same reading as upstream dev's first_vocal_onset (#6866): a weak run counts
+        config=PROTECTIVE_VOCAL_CONFIG,
     )
     return mask.windows[0][0] if mask.windows else None
 

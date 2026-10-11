@@ -22,6 +22,7 @@ from music_assistant_models.media_items import AudioFormat, ProviderMapping, Sou
 from music_assistant_models.queue_item import QueueItem
 from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.controllers.streams.smart_fades.vocal import VOCAL_LEFT_PADDING
 from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.models.plugin import VoiceOver
 from music_assistant.providers.ai_radio.constants import (
@@ -728,14 +729,14 @@ async def test_audio_analysis_times_a_track_without_lyrics() -> None:
         AsyncMock(return_value=(None, None)), AsyncMock(return_value=_vocal_analysis(14.0))
     )
     onset, reason = await renderer._resolve_vocal_onset(_track_with_lyrics(None))
-    assert onset == pytest.approx(14.0)
+    assert onset == pytest.approx(14.0 - VOCAL_LEFT_PADDING)
     assert reason == ""
 
 
 @pytest.mark.parametrize(
     ("audio", "expected"),
     [
-        pytest.param(20.0, 20.0, id="audio well after the lyrics"),
+        pytest.param(20.0, 20.0 - VOCAL_LEFT_PADDING, id="audio well after the lyrics"),
         pytest.param(11.0, 8.0, id="audio a little after"),
         pytest.param(3.0, 8.0, id="audio before the lyrics"),
         pytest.param(None, 8.0, id="audio hears no voice"),
@@ -787,7 +788,7 @@ async def test_a_copy_without_a_timeline_does_not_hide_one_with_it() -> None:
         path="/music/resolved.flac",
     )
     onset, _reason = await renderer._resolve_vocal_onset(track)
-    assert onset == pytest.approx(9.0)
+    assert onset == pytest.approx(9.0 - VOCAL_LEFT_PADDING)
 
 
 async def test_analysis_without_a_voice_says_so() -> None:

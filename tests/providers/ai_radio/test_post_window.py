@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from music_assistant.controllers.streams.smart_fades.vocal import VOCAL_LEFT_PADDING
 from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.providers.ai_radio.constants import POST_AUDIO_ONSET_LEAD
 from music_assistant.providers.ai_radio.post_window import (
@@ -156,13 +157,15 @@ def test_lyrics_with_only_labels_have_no_onset() -> None:
 
 def test_audio_onset_is_where_the_first_voice_starts() -> None:
     """A confident, sustained run of vocal activity marks the entry."""
-    assert audio_onset(_vocal_timeline((12.0, 40.0, 0.95))) == pytest.approx(12.0)
+    assert audio_onset(_vocal_timeline((12.0, 40.0, 0.95))) == pytest.approx(
+        12.0 - VOCAL_LEFT_PADDING
+    )
 
 
-def test_a_weak_blip_in_the_intro_is_not_the_onset() -> None:
-    """A short run that never reaches Smart Fades' confidence gate is not a voice."""
+def test_a_weak_blip_in_the_intro_counts_as_the_onset() -> None:
+    """Like upstream's protective reading, a weak run is taken as a voice."""
     analysis = _vocal_timeline((3.0, 3.5, 0.6), (12.0, 40.0, 0.95))
-    assert audio_onset(analysis) == pytest.approx(12.0)
+    assert audio_onset(analysis) == pytest.approx(3.0 - VOCAL_LEFT_PADDING)
 
 
 def test_a_timeline_without_a_voice_has_no_onset() -> None:
