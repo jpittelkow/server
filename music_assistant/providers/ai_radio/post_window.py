@@ -13,13 +13,14 @@ import re
 from typing import TYPE_CHECKING
 
 from music_assistant.controllers.streams.smart_fades.vocal import (
+    DEFAULT_VOCAL_CONFIG,
     PROTECTIVE_VOCAL_CONFIG,
     build_vocal_windows,
     parse_vocal_probabilities,
 )
 from music_assistant.helpers.lyrics import normalize_lrc_lyrics
 
-from .constants import POST_AUDIO_ONSET_LEAD
+from .constants import POST_ANALYSIS_VOICE_COVERAGE, POST_AUDIO_ONSET_LEAD
 
 if TYPE_CHECKING:
     from music_assistant.models.audio_analysis import AudioAnalysisData
@@ -136,7 +137,9 @@ def audio_onset(analysis: AudioAnalysisData | None) -> float | None:
     return mask.windows[0][0] if mask.windows else None
 
 
-def choose_vocal_onset(lyrics: float | None, audio: float | None) -> float | None:
+def choose_vocal_onset(
+    lyrics: float | None, audio: float | None, analysis: AudioAnalysisData | None = None
+) -> float | None:
     """
     Return the vocal onset a post should end before, from whichever sources have one.
 
@@ -153,4 +156,35 @@ def choose_vocal_onset(lyrics: float | None, audio: float | None) -> float | Non
     # the false start
     if audio is not None and audio - lyrics > POST_AUDIO_ONSET_LEAD:
         return audio
+    # an earlier audio onset with unbroken voice up to the lyric line means late lyrics
+    if (
+        audio is not None
+        and analysis is not None
+        and audio < lyrics
+        and voice_coverage(analysis, audio, lyrics) >= POST_ANALYSIS_VOICE_COVERAGE
+    ):
+        return audio
     return lyrics
+
+
+def voice_coverage(analysis: AudioAnalysisData, start: float, end: float) -> float:
+    """
+    Return the share of a stretch the analysis hears as voice, from 0 to 1.
+
+    :param analysis: The track's stored audio analysis.
+    :param start: Start of the stretch, in seconds.
+    :param end: End of the stretch, in seconds.
+    """
+    if end <= start or (timeline := parse_vocal_probabilities(analysis)) is None:
+        return 0.0
+    duration = float(analysis.duration or 0.0)
+    mask = build_vocal_windows(
+        timeline.probabilities,
+        timeline.frame_duration,
+        0.0,
+        duration,
+        beat_duration=60.0 / analysis.bpm if analysis.bpm and analysis.bpm > 0.0 else None,
+        config=DEFAULT_VOCAL_CONFIG,
+    )
+    heard = sum(max(0.0, min(right, end) - max(left, start)) for left, right in mask.windows)
+    return heard / (end - start)

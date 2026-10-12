@@ -144,6 +144,9 @@ POST_ANALYSIS_TIMEOUT = 2.0
 # In blind listening on a real library, the later of two onsets more than 5 s apart was
 # right 27 times out of 32; a smaller gap buys too little talk time to risk the first line.
 POST_AUDIO_ONSET_LEAD = 5.0
+# an audio onset earlier than the lyrics is trusted only when the analysis hears voice over
+# at least this share of the stretch up to the lyric line (upstream PR #6882)
+POST_ANALYSIS_VOICE_COVERAGE = 0.9
 # a postable break is rendered once into a local, levelled copy; a render this slow is wedged
 POST_STAGE_TIMEOUT = 20
 # staged copies: their file name prefix, and the age past which one is a leftover to delete

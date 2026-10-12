@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     from music_assistant_models.queue_item import QueueItem
 
     from music_assistant.mass import MusicAssistant
+    from music_assistant.models.audio_analysis import AudioAnalysisData
 
     from .models import SessionState
 
@@ -544,10 +545,10 @@ class AIRadioRenderMixin:
         if not isinstance(media_item, Track):
             return None, "no track details"
         # asked side by side, so the slower lookup alone bounds the wait
-        (lyrics, lyrics_reason), (audio, audio_reason) = await asyncio.gather(
+        (lyrics, lyrics_reason), (audio, audio_reason, analysis) = await asyncio.gather(
             self._lyrics_vocal_onset(media_item), self._audio_vocal_onset(queue_item, media_item)
         )
-        onset = choose_vocal_onset(lyrics, audio)
+        onset = choose_vocal_onset(lyrics, audio, analysis)
         if onset is None:
             return None, f"{lyrics_reason}; {audio_reason}"
         self.logger.debug(
@@ -581,7 +582,7 @@ class AIRadioRenderMixin:
 
     async def _audio_vocal_onset(
         self, queue_item: QueueItem, track: Track
-    ) -> tuple[float | None, str]:
+    ) -> tuple[float | None, str, AudioAnalysisData | None]:
         """Return the second the vocal enters according to stored audio analysis, or why not."""
         # the file the queue resolved is the one that will play; otherwise every source the
         # track is available from, best quality first, as the Smart Fades ordering reads them
@@ -602,14 +603,18 @@ class AIRadioRenderMixin:
                     )
                     analysed = analysed or analysis is not None
                     if (onset := audio_onset(analysis)) is not None:
-                        return onset, ""
+                        return onset, "", analysis
         except TimeoutError:
-            return None, f"audio analysis lookup took longer than {POST_ANALYSIS_TIMEOUT:.0f}s"
+            return (
+                None,
+                f"audio analysis lookup took longer than {POST_ANALYSIS_TIMEOUT:.0f}s",
+                None,
+            )
         except Exception as err:
             # the audio analysis only refines the post; its failure must never cost the clip
             self.logger.debug("Audio analysis lookup for %s failed: %s", track.name, err)
-            return None, f"audio analysis lookup failed ({err})"
-        return None, "audio analysis has no vocal timing" if analysed else "no audio analysis"
+            return None, f"audio analysis lookup failed ({err})", None
+        return None, "audio analysis has no vocal timing" if analysed else "no audio analysis", None
 
     def _remaining_media_lifetime(self, media: _CachedClipMedia) -> int:
         """Return the seconds the given minted media is still usable for."""

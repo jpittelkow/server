@@ -738,7 +738,8 @@ async def test_audio_analysis_times_a_track_without_lyrics() -> None:
     [
         pytest.param(20.0, 20.0 - VOCAL_LEFT_PADDING, id="audio well after the lyrics"),
         pytest.param(11.0, 8.0, id="audio a little after"),
-        pytest.param(3.0, 8.0, id="audio before the lyrics"),
+        # unbroken voice from 3 s up to the lyric line: the lyrics are late (#6882 guard)
+        pytest.param(3.0, 3.0 - VOCAL_LEFT_PADDING, id="unbroken voice before the lyrics"),
         pytest.param(None, 8.0, id="audio hears no voice"),
     ],
 )
