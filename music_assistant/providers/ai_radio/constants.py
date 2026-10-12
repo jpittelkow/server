@@ -138,6 +138,10 @@ POST_LYRICS_TIMEOUT = 8.0
 # listening on a real library, the analysis was early far more often than the lyrics were
 # late, and posts timed from the analysis this much later were preferred 9 times out of 10.
 POST_ANALYSIS_ONSET_LEAD = 5.0
+# an analysed onset earlier than the lyrics is trusted only when the analysis hears voice over
+# at least this share of the stretch up to the lyric line: a singer the lyrics place late keeps
+# singing through it, while a count-in, a chant or crowd noise stops and leaves a gap
+POST_ANALYSIS_VOICE_COVERAGE = 0.9
 # loading the next record resolves its stream details with its provider; same budget
 POST_LOAD_TIMEOUT = 8.0
 

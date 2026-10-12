@@ -1,7 +1,8 @@
 """
-Vocal-onset detection for posts: the second the singing starts, read from synced lyrics.
+Vocal-onset detection for posts: the second the singing starts.
 
-Parsing is left to :func:`normalize_lrc_lyrics`, which strips ID tags and word timings,
+Two sources can tell: synced lyrics, and the vocal-activity timeline in the stored audio
+analysis. Lyric parsing is left to :func:`normalize_lrc_lyrics`, which strips ID tags and word timings,
 expands multi-timestamp lines and sorts the result, so only the leading timestamp of a
 normalised line is read here.
 """
@@ -9,8 +10,20 @@ normalised line is read here.
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
+from music_assistant.controllers.streams.smart_fades.vocal import (
+    DEFAULT_VOCAL_CONFIG,
+    build_vocal_windows,
+    first_vocal_onset,
+    parse_vocal_probabilities,
+)
 from music_assistant.helpers.lyrics import normalize_lrc_lyrics
+
+from .constants import POST_ANALYSIS_ONSET_LEAD, POST_ANALYSIS_VOICE_COVERAGE
+
+if TYPE_CHECKING:
+    from music_assistant.models.audio_analysis import AudioAnalysisData
 
 # the leading [mm:ss.xx] of a line that normalize_lrc_lyrics has already produced
 _LEADING_TIMESTAMP_RE = re.compile(r"^\[(\d{1,3}):(\d{1,2}(?:[.:]\d{1,3})?)\]\s*(.*)$")
@@ -90,3 +103,54 @@ def lyric_onset(lrc_lyrics: str | None) -> float | None:
             continue
         return int(match.group(1)) * 60 + float(match.group(2).replace(":", "."))
     return None
+
+
+def voice_coverage(analysis: AudioAnalysisData, start: float, end: float) -> float:
+    """
+    Return the share of a stretch the analysis hears as voice, from 0 to 1.
+
+    Reads the vocal windows with Smart Fades' default confidence gates, so a weak blip
+    does not count. A missing or malformed timeline hears nothing.
+
+    :param analysis: The track's stored audio analysis.
+    :param start: Start of the stretch, in seconds.
+    :param end: End of the stretch, in seconds.
+    """
+    if end <= start or (timeline := parse_vocal_probabilities(analysis)) is None:
+        return 0.0
+    assert analysis.duration is not None  # guaranteed by the validated timeline
+    mask = build_vocal_windows(
+        timeline.probabilities,
+        timeline.frame_duration,
+        0.0,
+        analysis.duration,
+        beat_duration=60.0 / analysis.bpm if analysis.bpm and analysis.bpm > 0.0 else None,
+        config=DEFAULT_VOCAL_CONFIG,
+    )
+    heard = sum(max(0.0, min(right, end) - max(left, start)) for left, right in mask.windows)
+    return heard / (end - start)
+
+
+def choose_vocal_onset(lyrics: float | None, analysis: AudioAnalysisData | None) -> float | None:
+    """
+    Return the second the singing starts, from whichever sources can tell.
+
+    The lyric onset leads. The analysed onset replaces it when it is more than
+    POST_ANALYSIS_ONSET_LEAD seconds later, or when it is earlier and the analysis hears
+    voice through almost all of the stretch up to the lyric line. With one source, that
+    one is used.
+
+    :param lyrics: Onset read from synced lyrics, or None.
+    :param analysis: The track's stored audio analysis, or None.
+    """
+    heard = first_vocal_onset(analysis) if analysis is not None else None
+    if lyrics is None or heard is None:
+        return lyrics if heard is None else heard
+    if heard - lyrics > POST_ANALYSIS_ONSET_LEAD:
+        return heard
+    # an earlier analysed onset is usually a count-in, a chant or crowd noise that stops
+    # before the singing; unbroken voice up to the lyric line means the lyrics are late
+    assert analysis is not None  # heard is only set from an analysis
+    if heard < lyrics and voice_coverage(analysis, heard, lyrics) >= POST_ANALYSIS_VOICE_COVERAGE:
+        return heard
+    return lyrics
